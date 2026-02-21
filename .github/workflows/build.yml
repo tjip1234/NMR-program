@@ -2,105 +2,176 @@ name: Build & Release
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     tags: ["v*"]
   pull_request:
-    branches: [main, master]
+    branches: [main]
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: nmr_gui
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: nmr_gui-linux-x86_64
-            binary: nmr_gui
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: nmr_gui-windows-x86_64
-            binary: nmr_gui.exe
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: nmr_gui-macos-aarch64
-            binary: nmr_gui
-
-    runs-on: ${{ matrix.os }}
-
+  build-linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # Linux: install system dependencies for eframe/egui
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libssl-dev \
-            libfontconfig1-dev libfreetype6-dev \
-            libatk1.0-dev libcairo2-dev libgdk-pixbuf2.0-dev \
-            libglib2.0-dev libpango1.0-dev
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libfontconfig1-dev \
+            libatk1.0-dev \
+            libgdk-pixbuf2.0-dev \
+            libpango1.0-dev \
+            libcairo2-dev
 
-      - name: Build (release)
-        run: cargo build --release --target ${{ matrix.target }}
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Package
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
-          chmod +x dist/${{ matrix.binary }}
-          tar -czf ${{ matrix.artifact }}.tar.gz -C dist .
+          cp target/release/nmr-gui dist/
+          cp README.md dist/
+          cp -r example.svg dist/ 2>/dev/null || true
+          cd dist && tar czf ../nmr-gui-linux-x86_64.tar.gz *
 
-      - name: Package artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.artifact }}.zip"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
-          if-no-files-found: ignore
+          name: nmr-gui-linux-x86_64
+          path: nmr-gui-linux-x86_64.tar.gz
+          retention-days: 14
 
-  # Create a GitHub release when a version tag is pushed
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+  build-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
         with:
-          path: artifacts
+          path: |
+            ~\.cargo\bin\
+            ~\.cargo\registry\index\
+            ~\.cargo\registry\cache\
+            ~\.cargo\git\db\
+            target\
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/nmr-gui.exe dist/
+          cp README.md dist/
+          cp example.svg dist/ 2>/dev/null || true
+          cd dist && 7z a ../nmr-gui-windows-x86_64.zip *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nmr-gui-windows-x86_64
+          path: nmr-gui-windows-x86_64.zip
+          retention-days: 14
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: Build release
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/nmr-gui dist/
+          cp README.md dist/
+          cp example.svg dist/ 2>/dev/null || true
+          cd dist && tar czf ../nmr-gui-macos-aarch64.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nmr-gui-macos-aarch64
+          path: nmr-gui-macos-aarch64.tar.gz
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nmr-gui-linux-x86_64
+          path: ./artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nmr-gui-windows-x86_64
+          path: ./artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nmr-gui-macos-aarch64
+          path: ./artifacts/
+
+      - name: List artifacts
+        run: ls -la ./artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
+            ./artifacts/nmr-gui-linux-x86_64.tar.gz
+            ./artifacts/nmr-gui-windows-x86_64.zip
+            ./artifacts/nmr-gui-macos-aarch64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
