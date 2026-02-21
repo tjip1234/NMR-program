@@ -4,7 +4,7 @@
 
 A desktop NMR spectral processing app written in Rust with [egui](https://github.com/emilk/egui). Drag in your FID, click some buttons, get a spectrum. Every single operation is logged so you (or your PI) can reproduce exactly what happened.
 
-NMRPipe can be used as a backend, but the app runs perfectly fine without it using built-in Rust implementations..... or does it? 
+NMRPipe can be used as a backend if installed and in the $PATH$, but the app runs perfectly fine without it using built-in Rust implementations..... or does it? 
 
 ![Example 1H export](example.svg)
 
@@ -156,7 +156,7 @@ src/
 
 ## License
 
-MIT
+idk
 
 ---
 
