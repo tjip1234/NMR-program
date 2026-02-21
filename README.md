@@ -1,6 +1,6 @@
 # NMR Spectral Processing GUI
 
-> It's a piece of shit, but it's *our* piece of shit — and honestly? It works.
+> It's a piece of vibe coded hotmess that mostly works (for me atleast)
 
 A desktop NMR spectral processing app written in Rust with [egui](https://github.com/emilk/egui). Drag in your FID, click some buttons, get a spectrum. Every single operation is logged so you (or your PI) can reproduce exactly what happened.
 
@@ -107,7 +107,7 @@ Works in two modes:
 | Mode | Status bar | What happens |
 |---|---|---|
 | **NMRPipe installed** | 🟢 NMRPipe | Uses `bruk2pipe`, `var2pipe` for conversion; subprocess calls for processing |
-| **Without NMRPipe** | 🟡 Built-in mode | Pure Rust implementations for everything; JEOL files read natively |
+| **Without NMRPipe** | 🟡 Built-in mode | Pure Rust implementations for everything;|
 
 The reproducibility log records NMRPipe-equivalent commands regardless of which mode is used, so the output is always reproducible.
 
@@ -141,19 +141,6 @@ src/
     └── reproducibility.rs      # Logging system
 ```
 
-## Test data
-
-The `test-files/` directory has JEOL Delta files for 2-chlorobutane:
-
-| File | Experiment |
-|---|---|
-| `*_PROTON-2-1.jdf` | ¹H |
-| `*_CARBON-2-1.jdf` | ¹³C |
-| `*_135-1-1.jdf` | DEPT-135 |
-| `*_COSY-2-1.jdf` | COSY (2D) |
-| `*_HSQC_NUS-2-1.jdf` | HSQC (2D) |
-| `*_HMBC_NUS-2-1.jdf` | HMBC (2D) |
-
 ## Tech stack
 
 | Component | Crate |
@@ -173,4 +160,4 @@ MIT
 
 ---
 
-> *Is it good? No. Does it work? Mostly. Will it corrupt your data? Probably not. Should you use TopSpin instead? Maybe. But this one is free, open source, and it's ours.*
+> *Is it good? No. Does it work? Mostly. Will it corrupt your data? Probably not.
