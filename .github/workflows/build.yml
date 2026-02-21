@@ -56,7 +56,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/nmr-gui dist/
+          cp target/release/nmr_gui dist/nmr-gui
           cp README.md dist/
           cp -r example.svg dist/ 2>/dev/null || true
           cd dist && tar czf ../nmr-gui-linux-x86_64.tar.gz *
@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/nmr-gui.exe dist/
+          cp target/release/nmr_gui.exe dist/nmr-gui.exe
           cp README.md dist/
           cp example.svg dist/ 2>/dev/null || true
           cd dist && 7z a ../nmr-gui-windows-x86_64.zip *
@@ -129,7 +129,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/aarch64-apple-darwin/release/nmr-gui dist/
+          cp target/aarch64-apple-darwin/release/nmr_gui dist/nmr-gui
           cp README.md dist/
           cp example.svg dist/ 2>/dev/null || true
           cd dist && tar czf ../nmr-gui-macos-aarch64.tar.gz *
