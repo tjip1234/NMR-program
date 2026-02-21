@@ -194,11 +194,14 @@ impl ReproLog {
 
     /// Save log as shell script
     pub fn save_script(&self, path: &Path) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, self.to_shell_script())?;
-        // Make executable
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(path, perms)?;
+        // Make executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(path, perms)?;
+        }
         Ok(())
     }
 }
