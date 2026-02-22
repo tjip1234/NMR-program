@@ -91,6 +91,9 @@ pub struct NmrApp {
     current_theme: AppTheme,
     theme_colors: ThemeColors,
 
+    /// Current conversion method (NMRPipe vs Built-in)
+    conversion_method: crate::gui::conversion_dialog::ConversionMethod,
+
     /// Dropped files buffer
     dropped_files: Vec<PathBuf>,
 }
@@ -160,6 +163,11 @@ impl NmrApp {
             nmrpipe_available,
             current_theme: default_theme,
             theme_colors: theme_colors,
+            conversion_method: if nmrpipe_available {
+                crate::gui::conversion_dialog::ConversionMethod::NMRPipe
+            } else {
+                crate::gui::conversion_dialog::ConversionMethod::BuiltIn
+            },
             dropped_files: Vec::new(),
         }
     }
@@ -197,6 +205,13 @@ impl NmrApp {
         self.do_load(&target, None);
     }
 
+    /// Build ConversionSettings with the current conversion method
+    fn make_settings(&self, base: Option<&crate::gui::conversion_dialog::ConversionSettings>) -> crate::gui::conversion_dialog::ConversionSettings {
+        let mut s = base.cloned().unwrap_or_default();
+        s.conversion_method = self.conversion_method;
+        s
+    }
+
     /// Actually perform the loading (after any dialog).
     fn do_load(
         &mut self,
@@ -210,7 +225,8 @@ impl NmrApp {
         self.redo_stack.clear();
         self.before_snapshot = None;
         self.fid_snapshot = None;
-        self.domain_tab = DomainTab::TimeDomain;
+        // Reset phase dialog from previous file
+        self.phase_dialog_state = PhaseDialogState::default();
 
         // Reset all annotations from previous file
         self.spectrum_view_state.peaks.clear();
@@ -226,15 +242,44 @@ impl NmrApp {
         self.spectrum_view_state.j_coupling_picking = false;
         self.spectrum_view_state.auto_scale = true;
 
-        match conversion::load_spectrum(path, &mut self.repro_log, settings) {
+        // Merge user-provided settings with current conversion method
+        let merged = self.make_settings(settings);
+
+        // Set domain tab based on what we actually loaded
+        // (will be updated below after successful load to match the data)
+
+        match conversion::load_spectrum(path, &mut self.repro_log, Some(&merged)) {
             Ok(spectrum) => {
+                // Auto-select the correct domain tab based on loaded data
+                if spectrum.is_frequency_domain {
+                    self.domain_tab = DomainTab::FrequencyDomain;
+                } else {
+                    self.domain_tab = DomainTab::TimeDomain;
+                }
+                let pts_info = if spectrum.is_2d() {
+                    format!("{}×{}",
+                        spectrum.data_2d.len(),
+                        spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0))
+                } else {
+                    format!("{} pts", spectrum.real.len())
+                };
                 self.status_message = format!(
-                    "Loaded: {} ({}, {} pts, {})",
+                    "Loaded: {} ({}, {}, {}) [{}]",
                     spectrum.sample_name,
                     spectrum.experiment_type,
-                    spectrum.real.len(),
+                    pts_info,
                     spectrum.vendor_format,
+                    if spectrum.conversion_method_used.is_empty() {
+                        "unknown method"
+                    } else {
+                        &spectrum.conversion_method_used
+                    },
                 );
+                // Set nucleus and experiment info in the log
+                let nucleus = spectrum.axes.first()
+                    .map(|a| a.nucleus.to_string())
+                    .unwrap_or_default();
+                self.repro_log.set_spectrum_info(&nucleus, &spectrum.experiment_type.to_string());
                 self.spectrum = Some(spectrum);
             }
             Err(e) => {
@@ -260,6 +305,7 @@ impl NmrApp {
                 self.redo_stack.push((op.clone(), current));
             }
             self.spectrum = Some(snapshot);
+            self.before_snapshot = None; // Clear stale comparison
             self.repro_log.pop_entry();
             self.status_message = format!("Undone: {}", op);
         }
@@ -1208,6 +1254,25 @@ impl NmrApp {
                 );
                 self.domain_tab = DomainTab::FrequencyDomain;
             }
+            PipelineAction::ApplyFT2D => {
+                // Snapshot the FID before transforming so user can undo
+                if let Some(s) = &self.spectrum {
+                    self.fid_snapshot = Some(s.clone());
+                }
+                let op = ProcessingOp::FourierTransform2D;
+                self.push_undo(op);
+                let spectrum = self.spectrum.as_mut().unwrap();
+                let n_rows = spectrum.data_2d.len();
+                let n_cols = spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0);
+                processing::fourier_transform_2d(spectrum, &mut self.repro_log);
+                let new_rows = spectrum.data_2d.len();
+                let new_cols = spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0);
+                self.status_message = format!(
+                    "2D Fourier Transform: {}×{} → {}×{} (magnitude mode)",
+                    n_rows, n_cols, new_rows, new_cols
+                );
+                self.domain_tab = DomainTab::FrequencyDomain;
+            }
             PipelineAction::ApplyPhaseCorrection => {
                 let ph0 = self.pipeline_state.ph0;
                 let ph1 = self.pipeline_state.ph1;
@@ -1258,6 +1323,10 @@ impl NmrApp {
                 self.spectrum_view_state.baseline_picking =
                     !self.spectrum_view_state.baseline_picking;
                 if self.spectrum_view_state.baseline_picking {
+                    // Disable other picking modes
+                    self.spectrum_view_state.peak_picking = false;
+                    self.spectrum_view_state.integration_picking = false;
+                    self.spectrum_view_state.j_coupling_picking = false;
                     self.status_message =
                         "Baseline picking ON — click on the spectrum to place anchor points"
                             .to_string();
@@ -1294,6 +1363,14 @@ impl NmrApp {
                 let pts_per_hz = if sw_hz > 0.0 { n as f64 / sw_hz } else { 1.0 };
                 let min_dist = ((min_spacing_hz * pts_per_hz) as usize).max(2);
                 let peaks = processing::detect_peaks(spectrum, threshold, min_dist);
+                let peak_ppm_list: Vec<String> = peaks.iter().take(20).map(|p| format!("{:.3}", p[0])).collect();
+                let desc = format!(
+                    "Found {} peaks (threshold {:.0}%, min spacing {:.1} Hz): [{}]{}",
+                    peaks.len(), threshold * 100.0, min_spacing_hz,
+                    peak_ppm_list.join(", "),
+                    if peaks.len() > 20 { "..." } else { "" }
+                );
+                self.repro_log.add_entry("Peak Detection", &desc, "# automatic peak picking (no NMRPipe equivalent)");
                 self.status_message = format!(
                     "Detected {} peaks (threshold {:.0}%, min spacing {:.1} Hz)",
                     peaks.len(), threshold * 100.0, min_spacing_hz
@@ -1301,8 +1378,10 @@ impl NmrApp {
                 self.spectrum_view_state.peaks = peaks;
             }
             PipelineAction::ClearPeaks => {
+                let n = self.spectrum_view_state.peaks.len();
                 self.spectrum_view_state.peaks.clear();
                 self.spectrum_view_state.multiplets.clear();
+                self.repro_log.add_entry("Clear Peaks", &format!("Cleared {} peaks and associated multiplets", n), "");
                 self.status_message = "Peaks cleared".to_string();
             }
             PipelineAction::TogglePeakPicking => {
@@ -1357,6 +1436,9 @@ impl NmrApp {
                     obs_mhz,
                 );
                 let summary: Vec<String> = multiplets.iter().map(|m| m.to_string()).collect();
+                let desc = format!("Detected {} multiplets from {} peaks: {}",
+                    multiplets.len(), self.spectrum_view_state.peaks.len(), summary.join("; "));
+                self.repro_log.add_entry("Multiplet Detection", &desc, "# automatic multiplet analysis (no NMRPipe equivalent)");
                 self.status_message = format!(
                     "Detected {} multiplets: {}",
                     multiplets.len(),
@@ -1365,13 +1447,19 @@ impl NmrApp {
                 self.spectrum_view_state.multiplets = multiplets;
             }
             PipelineAction::ClearMultiplets => {
+                let n = self.spectrum_view_state.multiplets.len();
                 self.spectrum_view_state.multiplets.clear();
+                self.repro_log.add_entry("Clear Multiplets", &format!("Cleared {} multiplets", n), "");
                 self.status_message = "Multiplets cleared".to_string();
             }
             PipelineAction::ToggleIntegrationPicking => {
                 self.spectrum_view_state.integration_picking =
                     !self.spectrum_view_state.integration_picking;
                 if self.spectrum_view_state.integration_picking {
+                    // Disable other picking modes
+                    self.spectrum_view_state.peak_picking = false;
+                    self.spectrum_view_state.baseline_picking = false;
+                    self.spectrum_view_state.j_coupling_picking = false;
                     self.spectrum_view_state.integration_start = None;
                     self.status_message =
                         "Integration picking ON — click start and end points on the spectrum"
@@ -1382,14 +1470,20 @@ impl NmrApp {
                 }
             }
             PipelineAction::ClearIntegrations => {
+                let n = self.spectrum_view_state.integrations.len();
                 self.spectrum_view_state.integrations.clear();
                 self.spectrum_view_state.integration_start = None;
+                self.repro_log.add_entry("Clear Integrations", &format!("Cleared {} integration regions", n), "");
                 self.status_message = "Integrations cleared".to_string();
             }
             PipelineAction::ToggleJCouplingPicking => {
                 self.spectrum_view_state.j_coupling_picking =
                     !self.spectrum_view_state.j_coupling_picking;
                 if self.spectrum_view_state.j_coupling_picking {
+                    // Disable other picking modes
+                    self.spectrum_view_state.peak_picking = false;
+                    self.spectrum_view_state.baseline_picking = false;
+                    self.spectrum_view_state.integration_picking = false;
                     self.spectrum_view_state.j_coupling_first = None;
                     self.status_message =
                         "J-coupling measurement ON — click two peaks to measure spacing"
@@ -1400,8 +1494,10 @@ impl NmrApp {
                 }
             }
             PipelineAction::ClearJCouplings => {
+                let n = self.spectrum_view_state.j_couplings.len();
                 self.spectrum_view_state.j_couplings.clear();
                 self.spectrum_view_state.j_coupling_first = None;
+                self.repro_log.add_entry("Clear J-Couplings", &format!("Cleared {} J-coupling measurements", n), "");
                 self.status_message = "J-coupling measurements cleared".to_string();
             }
             PipelineAction::None => {}
@@ -1443,6 +1539,20 @@ impl NmrApp {
         self.spectrum_view_state.baseline_points = save.baseline_points;
         self.spectrum_view_state.auto_scale = true;
 
+        // Reset picking modes from previous session
+        self.spectrum_view_state.peak_picking = false;
+        self.spectrum_view_state.baseline_picking = false;
+        self.spectrum_view_state.integration_picking = false;
+        self.spectrum_view_state.j_coupling_picking = false;
+        self.spectrum_view_state.integration_start = None;
+        self.spectrum_view_state.j_coupling_first = None;
+
+        // Reset phase dialog
+        self.phase_dialog_state = PhaseDialogState::default();
+
+        // Reset pipeline state
+        self.pipeline_state = PipelinePanelState::default();
+
         // Restore domain tab
         if save.is_frequency_domain {
             self.domain_tab = DomainTab::FrequencyDomain;
@@ -1451,10 +1561,13 @@ impl NmrApp {
         }
 
         // Restore theme
-        if save.theme.contains("Cyberpunk") {
-            self.current_theme = AppTheme::Cyberpunk;
-            self.theme_colors = ThemeColors::from_theme(AppTheme::Cyberpunk);
-        }
+        let new_theme = if save.theme.contains("Cyberpunk") {
+            AppTheme::Cyberpunk
+        } else {
+            AppTheme::Light
+        };
+        self.current_theme = new_theme;
+        self.theme_colors = ThemeColors::from_theme(new_theme);
 
         // Reset processing state
         self.undo_stack.clear();
@@ -1573,7 +1686,22 @@ impl NmrApp {
                 // apply_theme needs a reference to ctx, but we don't have it here;
                 // we'll apply it lazily on next frame via update()
             }
-            _ => {}
+            ToolbarAction::ToggleConversionMethod => {
+                use crate::gui::conversion_dialog::ConversionMethod;
+                self.conversion_method = match self.conversion_method {
+                    ConversionMethod::NMRPipe => ConversionMethod::BuiltIn,
+                    ConversionMethod::BuiltIn => ConversionMethod::NMRPipe,
+                };
+                self.status_message = format!(
+                    "Conversion method: {} — reload file to apply",
+                    self.conversion_method.label()
+                );
+            }
+            ToolbarAction::ZoomReset => {
+                self.spectrum_view_state.auto_scale = true;
+                self.status_message = "Zoom reset".to_string();
+            }
+            ToolbarAction::None => {}
         }
     }
 
@@ -1709,7 +1837,14 @@ impl eframe::App for NmrApp {
 
         // ── Toolbar ──
         let theme_label = self.current_theme.label();
-        let toolbar_action = toolbar::show_toolbar(ctx, theme_label);
+        let method_label = self.conversion_method.short_label();
+        let toolbar_action = toolbar::show_toolbar(
+            ctx,
+            theme_label,
+            method_label,
+            !self.undo_stack.is_empty(),
+            !self.redo_stack.is_empty(),
+        );
         if toolbar_action != ToolbarAction::None {
             self.handle_toolbar_action(toolbar_action);
         }
@@ -1758,6 +1893,49 @@ impl eframe::App for NmrApp {
                         .color(sb_text),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Conversion method indicator (clickable to toggle)
+                    {
+                        use crate::gui::conversion_dialog::ConversionMethod;
+                        let (method_icon, method_text, method_color) = match self.conversion_method {
+                            ConversionMethod::NMRPipe => ("⚡", "NMRPipe", sb_success),
+                            ConversionMethod::BuiltIn => ("📦", "Built-in", sb_warning),
+                        };
+                        let badge = egui::Button::new(
+                            egui::RichText::new(format!("{} {}", method_icon, method_text))
+                                .size(11.0)
+                                .color(method_color),
+                        )
+                        .fill(method_color.linear_multiply(0.1))
+                        .stroke(egui::Stroke::new(1.0, method_color.linear_multiply(0.3)))
+                        .corner_radius(8.0);
+                        if ui.add(badge).on_hover_text(
+                            "Click to switch conversion method.\n\
+                             NMRPipe: uses bruk2pipe / delta2pipe / var2pipe\n\
+                             Built-in: native readers, no NMRPipe required"
+                        ).clicked() {
+                            self.conversion_method = match self.conversion_method {
+                                ConversionMethod::NMRPipe => ConversionMethod::BuiltIn,
+                                ConversionMethod::BuiltIn => ConversionMethod::NMRPipe,
+                            };
+                            self.status_message = format!(
+                                "Conversion method: {} — reload file to apply",
+                                self.conversion_method.label()
+                            );
+                        }
+                    }
+                    // Show what method was used for current spectrum
+                    if let Some(spectrum) = &self.spectrum {
+                        if !spectrum.conversion_method_used.is_empty() {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("via {}", spectrum.conversion_method_used))
+                                    .size(10.0)
+                                    .italics()
+                                    .color(sb_muted),
+                            );
+                        }
+                    }
+                    ui.separator();
                     if self.nmrpipe_available {
                         ui.colored_label(
                             sb_success,
@@ -1766,7 +1944,7 @@ impl eframe::App for NmrApp {
                     } else {
                         ui.colored_label(
                             sb_warning,
-                            egui::RichText::new("○ Built-in").size(11.0),
+                            egui::RichText::new("○ no NMRPipe").size(11.0),
                         );
                     }
                     ui.separator();
@@ -1791,6 +1969,12 @@ impl eframe::App for NmrApp {
             .unwrap_or(false);
         let op_count = self.repro_log.len();
 
+        let is_2d = self
+            .spectrum
+            .as_ref()
+            .map(|s| s.is_2d())
+            .unwrap_or(false);
+
         let mut pipeline_action_deferred = PipelineAction::None;
         let picking_modes = pipeline_panel::PickingModes {
             peak_picking: self.spectrum_view_state.peak_picking,
@@ -1812,9 +1996,11 @@ impl eframe::App for NmrApp {
                         &mut self.pipeline_state,
                         has_data,
                         is_freq,
+                        is_2d,
                         op_count,
                         &picking_modes,
                         &mut self.spectrum_view_state.integration_reference_h,
+                        self.before_snapshot.is_some(),
                     );
                 });
             });
@@ -1841,6 +2027,13 @@ impl eframe::App for NmrApp {
                     if ui.add(td_btn).clicked() {
                         self.domain_tab = DomainTab::TimeDomain;
                         self.spectrum_view_state.auto_scale = true;
+                        // Reset picking modes when switching tabs
+                        self.spectrum_view_state.peak_picking = false;
+                        self.spectrum_view_state.baseline_picking = false;
+                        self.spectrum_view_state.integration_picking = false;
+                        self.spectrum_view_state.j_coupling_picking = false;
+                        self.spectrum_view_state.integration_start = None;
+                        self.spectrum_view_state.j_coupling_first = None;
                     }
 
                     ui.add_space(4.0);
@@ -1856,6 +2049,13 @@ impl eframe::App for NmrApp {
                     if ui.add(fd_btn).clicked() {
                         self.domain_tab = DomainTab::FrequencyDomain;
                         self.spectrum_view_state.auto_scale = true;
+                        // Reset picking modes when switching tabs
+                        self.spectrum_view_state.peak_picking = false;
+                        self.spectrum_view_state.baseline_picking = false;
+                        self.spectrum_view_state.integration_picking = false;
+                        self.spectrum_view_state.j_coupling_picking = false;
+                        self.spectrum_view_state.integration_start = None;
+                        self.spectrum_view_state.j_coupling_first = None;
                     }
 
                     ui.add_space(4.0);
@@ -2026,10 +2226,8 @@ impl eframe::App for NmrApp {
                     }
                 }
             } else if let Some(spectrum) = display_spectrum {
-                // Interactive phase controls (only on freq-domain 1D data)
-                let viewing_live_freq = self.domain_tab == DomainTab::FrequencyDomain
-                    || self.fid_snapshot.is_none();
-                if viewing_live_freq && spectrum.is_frequency_domain && !spectrum.is_2d() {
+                // Interactive phase controls (available on any 1D data — time or freq domain)
+                if !spectrum.is_2d() {
                     let phase_action =
                         phase_dialog::show_phase_controls(ui, &mut self.phase_dialog_state);
                     if phase_action != PhaseAction::None {
@@ -2039,7 +2237,10 @@ impl eframe::App for NmrApp {
 
                 if spectrum.is_2d() {
                     // 2D contour display
-                    contour_view::show_spectrum_2d(ui, spectrum, &mut self.contour_view_state);
+                    let ft_requested = contour_view::show_spectrum_2d(ui, spectrum, &mut self.contour_view_state);
+                    if ft_requested {
+                        pipeline_action_deferred = PipelineAction::ApplyFT2D;
+                    }
                 } else {
                     // 1D spectrum display
                     let before = if self.pipeline_state.show_before_after {
@@ -2056,6 +2257,40 @@ impl eframe::App for NmrApp {
                         &mut self.phase_dialog_state,
                         &self.theme_colors,
                     );
+
+                    // Drain pending analysis actions from click handlers and log them
+                    for action in self.spectrum_view_state.pending_actions.drain(..) {
+                        match action {
+                            spectrum_view::SpectrumAction::PeakAdded(peak) => {
+                                self.repro_log.add_entry(
+                                    "Manual Peak Pick",
+                                    &format!("Added peak at {:.4} ppm (intensity {:.1})", peak[0], peak[1]),
+                                    "# manual peak pick (no NMRPipe equivalent)",
+                                );
+                            }
+                            spectrum_view::SpectrumAction::PeakRemoved(ppm) => {
+                                self.repro_log.add_entry(
+                                    "Manual Peak Remove",
+                                    &format!("Removed peak near {:.4} ppm", ppm),
+                                    "# manual peak removal (no NMRPipe equivalent)",
+                                );
+                            }
+                            spectrum_view::SpectrumAction::IntegrationAdded(lo, hi, raw) => {
+                                self.repro_log.add_entry(
+                                    "Integration",
+                                    &format!("Integrated region {:.4}–{:.4} ppm (raw area = {:.2})", lo, hi, raw),
+                                    "# manual integration (no NMRPipe equivalent)",
+                                );
+                            }
+                            spectrum_view::SpectrumAction::JCouplingMeasured(ppm1, ppm2, _dppm, j_hz) => {
+                                self.repro_log.add_entry(
+                                    "J-Coupling Measurement",
+                                    &format!("Measured J = {:.1} Hz between {:.4} and {:.4} ppm", j_hz, ppm1, ppm2),
+                                    "# J-coupling measurement (no NMRPipe equivalent)",
+                                );
+                            }
+                        }
+                    }
                 }
             } else {
                 // Welcome screen

@@ -109,8 +109,10 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
         real: Vec::new(),
         imag: Vec::new(),
         data_2d: Vec::new(),
+        data_2d_imag: Vec::new(),
         is_frequency_domain: is_freq_domain,
         nmrpipe_path: Some(path.to_path_buf()),
+        conversion_method_used: String::new(),
     };
 
     let axis_x = AxisParams {
@@ -129,13 +131,25 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
         let orig_y = header[idx::FDF1ORIG] as f64;
         let ref_ppm_y = if obs_y > 0.0 { (orig_y + sw_y) / obs_y } else { 0.0 };
 
+        // Detect F1 nucleus from label in header
+        let label_f1 = decode_label(&header, idx::FDF1LABEL);
+        let nucleus_y = nucleus_from_label(&label_f1);
+        // Detect F2 nucleus from label in header
+        let label_f2 = decode_label(&header, idx::FDF2LABEL);
+        if !label_f2.is_empty() {
+            if let Some(ax) = spectrum.axes.first_mut() {
+                ax.nucleus = nucleus_from_label(&label_f2);
+                ax.label = label_f2;
+            }
+        }
+
         let axis_y = AxisParams {
-            nucleus: Nucleus::C13,
+            nucleus: nucleus_y,
             num_points: npts_y,
             spectral_width_hz: sw_y,
             observe_freq_mhz: obs_y,
             reference_ppm: ref_ppm_y,
-            label: "F1".to_string(),
+            label: if label_f1.is_empty() { "F1".to_string() } else { label_f1 },
         };
         spectrum.axes.push(axis_y);
     }
@@ -177,6 +191,7 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
             ax.num_points = spectrum.real.len();
         }
     } else {
+        // 2D data: split into rows
         let points_per_row = if npts_y > 0 {
             values.len() / npts_y
         } else {
@@ -186,8 +201,26 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
             let start = row * points_per_row;
             let end = (start + points_per_row).min(values.len());
             if start < values.len() {
-                spectrum.data_2d.push(values[start..end].to_vec());
+                let row_data = &values[start..end];
+                if is_complex && row_data.len() >= npts_x * 2 {
+                    // Complex data: extract real and imaginary parts
+                    let real_row: Vec<f64> = row_data.iter().step_by(2).copied().collect();
+                    let imag_row: Vec<f64> = row_data.iter().skip(1).step_by(2).copied().collect();
+                    spectrum.data_2d.push(real_row);
+                    spectrum.data_2d_imag.push(imag_row);
+                } else {
+                    spectrum.data_2d.push(row_data.to_vec());
+                    spectrum.data_2d_imag.push(vec![0.0; row_data.len()]);
+                }
             }
+        }
+        // Update x-axis num_points to match actual columns in data_2d
+        if let Some(first_row) = spectrum.data_2d.first() {
+            if let Some(ax) = spectrum.axes.first_mut() {
+                ax.num_points = first_row.len();
+            }
+            // Store first row as 1D projection for status display / fallback
+            spectrum.real = first_row.clone();
         }
     }
 
@@ -318,12 +351,12 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
     let sw_x = header[idx::FDF2SW] as f64;
     let obs_x = header[idx::FDF2OBS] as f64;
     let orig_x = header[idx::FDF2ORIG] as f64;
-    let ref_ppm_x = if obs_x > 0.0 { orig_x / obs_x } else { 0.0 };
+    let ref_ppm_x = if obs_x > 0.0 { (orig_x + sw_x) / obs_x } else { 0.0 };
 
     let sw_y = header[idx::FDF1SW] as f64;
     let obs_y = header[idx::FDF1OBS] as f64;
     let orig_y = header[idx::FDF1ORIG] as f64;
-    let ref_ppm_y = if obs_y > 0.0 { orig_y / obs_y } else { 0.0 };
+    let ref_ppm_y = if obs_y > 0.0 { (orig_y + sw_y) / obs_y } else { 0.0 };
 
     // Detect nucleus labels from header
     let label_f2 = decode_label(&header, idx::FDF2LABEL);
@@ -368,8 +401,10 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
         real: Vec::new(),
         imag: Vec::new(),
         data_2d: Vec::new(),
+        data_2d_imag: Vec::new(),
         is_frequency_domain: is_freq_domain,
         nmrpipe_path: Some(plane_files[0].to_path_buf()),
+        conversion_method_used: String::new(),
     };
 
     // Read data from each plane file
@@ -394,19 +429,32 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
             row.push(v as f64);
         }
 
-        // For complex data, take only the real part (every other value)
+        // For complex data, extract real and imaginary parts
         if is_complex_x && row.len() >= npts_x * 2 {
             let real_row: Vec<f64> = row.iter().step_by(2).copied().collect();
+            let imag_row: Vec<f64> = row.iter().skip(1).step_by(2).copied().collect();
             spectrum.data_2d.push(real_row);
+            spectrum.data_2d_imag.push(imag_row);
         } else {
+            let len = row.len();
             spectrum.data_2d.push(row);
+            spectrum.data_2d_imag.push(vec![0.0; len]);
         }
+    }
+
+    // Update x-axis num_points to match actual columns after complex extraction
+    if let Some(first_row) = spectrum.data_2d.first() {
+        if let Some(ax) = spectrum.axes.first_mut() {
+            ax.num_points = first_row.len();
+        }
+        // Store first row as 1D projection for status display / fallback
+        spectrum.real = first_row.clone();
     }
 
     log::info!(
         "Read 2D NMRPipe series: {} planes × {} points",
         spectrum.data_2d.len(),
-        npts_x,
+        spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0),
     );
 
     Ok(spectrum)

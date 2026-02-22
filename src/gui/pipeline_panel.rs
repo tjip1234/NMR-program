@@ -68,6 +68,7 @@ pub enum PipelineAction {
     ApplyApodization,
     ApplyZeroFill,
     ApplyFT,
+    ApplyFT2D,
     ApplyPhaseCorrection,
     ApplyAutoPhase,
     ApplyBaselineCorrection,
@@ -101,9 +102,11 @@ pub fn show_pipeline_panel(
     state: &mut PipelinePanelState,
     has_data: bool,
     is_freq_domain: bool,
+    is_2d: bool,
     operation_count: usize,
     picking: &PickingModes,
     integration_ref_h: &mut f64,
+    has_before_snapshot: bool,
 ) -> PipelineAction {
     let mut action = PipelineAction::None;
 
@@ -212,9 +215,22 @@ pub fn show_pipeline_panel(
         });
 
         ui.separator();
-        ui.checkbox(&mut state.ft_use_imaginary, "Use imaginary data (complex FFT)");
-        if ui.button("🔄 Fourier Transform").clicked() {
-            action = PipelineAction::ApplyFT;
+        if is_2d {
+            // 2D Fourier Transform
+            if ui.button("🔄 2D Fourier Transform").clicked() {
+                action = PipelineAction::ApplyFT2D;
+            }
+            ui.label(
+                egui::RichText::new("Applies complex FFT along F2 then F1,\nresult in magnitude mode.")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(0x88, 0x8C, 0x94)),
+            );
+        } else {
+            // 1D Fourier Transform
+            ui.checkbox(&mut state.ft_use_imaginary, "Use imaginary data (complex FFT)");
+            if ui.button("🔄 Fourier Transform").clicked() {
+                action = PipelineAction::ApplyFT;
+            }
         }
     }
 
@@ -403,8 +419,10 @@ pub fn show_pipeline_panel(
 
     ui.separator();
 
-    // Before/After toggle
-    ui.checkbox(&mut state.show_before_after, "👁 Show Before/After");
+    // Before/After toggle — only show when a snapshot exists
+    if has_before_snapshot {
+        ui.checkbox(&mut state.show_before_after, "👁 Show Before/After");
+    }
 
     action
 }

@@ -51,6 +51,7 @@ pub enum ProcessingOp {
     Apodization(WindowFunction),
     ZeroFill { target_size: usize },
     FourierTransform { use_imaginary: bool },
+    FourierTransform2D,
     PhaseCorrection { ph0: f64, ph1: f64 },
     AutoPhase,
     BaselineCorrection,
@@ -70,6 +71,7 @@ impl std::fmt::Display for ProcessingOp {
                     write!(f, "Fourier Transform (Real-only)")
                 }
             }
+            ProcessingOp::FourierTransform2D => write!(f, "2D Fourier Transform (Magnitude)"),
             ProcessingOp::PhaseCorrection { ph0, ph1 } => {
                 write!(f, "Phase Correction (PH0={:.1}°, PH1={:.1}°)", ph0, ph1)
             }
@@ -316,6 +318,158 @@ pub fn fourier_transform(
             fft_size
         ),
         &nmrpipe_cmd,
+    );
+}
+
+// =========================================================================
+//  2D Fourier Transform
+// =========================================================================
+
+/// Apply 2D FFT to a 2D time-domain spectrum (e.g. COSY, HSQC, HMBC).
+///
+/// Pipeline:
+///   1. FFT along F2 (direct / rows) — each row is a complex FID
+///   2. FFT along F1 (indirect / columns) — transpose, FFT each column
+///   3. Compute magnitude: sqrt(re² + im²) for display
+///
+/// After processing `data_2d` contains the magnitude spectrum and
+/// `data_2d_imag` is cleared.  `is_frequency_domain` is set to `true`.
+pub fn fourier_transform_2d(
+    spectrum: &mut SpectrumData,
+    log: &mut ReproLog,
+) {
+    if spectrum.is_frequency_domain {
+        log::warn!("2D data is already in frequency domain, skipping FT");
+        return;
+    }
+
+    let n_rows = spectrum.data_2d.len();
+    if n_rows == 0 {
+        return;
+    }
+    let n_cols = spectrum.data_2d[0].len();
+    if n_cols == 0 {
+        return;
+    }
+
+    let has_imag = !spectrum.data_2d_imag.is_empty()
+        && spectrum.data_2d_imag.len() == n_rows;
+
+    // ── Step 1: FFT along F2 (rows) ──
+    let fft_cols = next_power_of_two(n_cols);
+    let mut planner = FftPlanner::new();
+    let fft_f2 = planner.plan_fft_forward(fft_cols);
+
+    // Store complex result matrix (rows × fft_cols)
+    let mut re_2d = vec![vec![0.0f64; fft_cols]; n_rows];
+    let mut im_2d = vec![vec![0.0f64; fft_cols]; n_rows];
+
+    for row_idx in 0..n_rows {
+        let row_len = spectrum.data_2d[row_idx].len();
+        let mut buffer: Vec<Complex<f64>> = Vec::with_capacity(fft_cols);
+
+        for col in 0..fft_cols {
+            if col < row_len {
+                let re = spectrum.data_2d[row_idx][col];
+                let im = if has_imag && col < spectrum.data_2d_imag[row_idx].len() {
+                    spectrum.data_2d_imag[row_idx][col]
+                } else {
+                    0.0
+                };
+                buffer.push(Complex::new(re, im));
+            } else {
+                buffer.push(Complex::new(0.0, 0.0)); // zero-pad
+            }
+        }
+
+        // First-point correction (standard NMR convention)
+        if !buffer.is_empty() {
+            buffer[0] *= 0.5;
+        }
+
+        fft_f2.process(&mut buffer);
+
+        // FFT-shift (swap halves)
+        let half = fft_cols / 2;
+        for i in 0..fft_cols {
+            let si = (i + half) % fft_cols;
+            re_2d[row_idx][i] = buffer[si].re;
+            im_2d[row_idx][i] = buffer[si].im;
+        }
+    }
+
+    // ── Step 2: FFT along F1 (columns) ──
+    let fft_rows = next_power_of_two(n_rows);
+    let fft_f1 = planner.plan_fft_forward(fft_rows);
+
+    // Extend rows if needed (zero-pad in F1 dimension)
+    re_2d.resize(fft_rows, vec![0.0; fft_cols]);
+    im_2d.resize(fft_rows, vec![0.0; fft_cols]);
+
+    for col_idx in 0..fft_cols {
+        // Build column vector
+        let mut col_buf: Vec<Complex<f64>> = Vec::with_capacity(fft_rows);
+        for row_idx in 0..fft_rows {
+            col_buf.push(Complex::new(re_2d[row_idx][col_idx], im_2d[row_idx][col_idx]));
+        }
+
+        // First-point correction in F1
+        if !col_buf.is_empty() {
+            col_buf[0] *= 0.5;
+        }
+
+        fft_f1.process(&mut col_buf);
+
+        // FFT-shift (swap halves)
+        let half = fft_rows / 2;
+        for row_idx in 0..fft_rows {
+            let si = (row_idx + half) % fft_rows;
+            re_2d[row_idx][col_idx] = col_buf[si].re;
+            im_2d[row_idx][col_idx] = col_buf[si].im;
+        }
+    }
+
+    // ── Step 3: Compute magnitude and reverse axes ──
+    // Reverse each row so index 0 → highest ppm (matches 1D convention)
+    let mut magnitude = vec![vec![0.0f64; fft_cols]; fft_rows];
+    for row_idx in 0..fft_rows {
+        for col_idx in 0..fft_cols {
+            let re = re_2d[row_idx][col_idx];
+            let im = im_2d[row_idx][col_idx];
+            // Reverse column direction (so high ppm = left = index 0)
+            magnitude[row_idx][fft_cols - 1 - col_idx] = (re * re + im * im).sqrt();
+        }
+    }
+
+    // Reverse row order for F1 (so high ppm = top = index 0)
+    magnitude.reverse();
+
+    // Store result
+    spectrum.data_2d = magnitude;
+    spectrum.data_2d_imag.clear();
+    spectrum.is_frequency_domain = true;
+
+    // Also set the 1D projection (first row) for the status bar
+    spectrum.real = spectrum.data_2d.first().cloned().unwrap_or_default();
+    spectrum.imag.clear();
+
+    // Update axis sizes
+    if let Some(ax) = spectrum.axes.get_mut(0) {
+        ax.num_points = fft_cols;
+    }
+    if let Some(ax) = spectrum.axes.get_mut(1) {
+        ax.num_points = fft_rows;
+    }
+
+    log.add_entry(
+        "2D Fourier Transform",
+        &format!(
+            "Complex 2D FFT: {}×{} → {}×{} (magnitude mode)",
+            n_rows, n_cols, fft_rows, fft_cols
+        ),
+        &format!(
+            "nmrPipe -fn FT -auto  # F2\nnmrPipe -fn FT -auto  # F1"
+        ),
     );
 }
 

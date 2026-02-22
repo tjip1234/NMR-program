@@ -5,6 +5,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which method to use for reading vendor data
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ConversionMethod {
+    /// Use NMRPipe converter tools (bruk2pipe, delta2pipe, var2pipe)
+    NMRPipe,
+    /// Use built-in native readers (no NMRPipe required)
+    BuiltIn,
+}
+
+impl ConversionMethod {
+    pub fn label(&self) -> &str {
+        match self {
+            ConversionMethod::NMRPipe => "NMRPipe tools",
+            ConversionMethod::BuiltIn => "Built-in reader",
+        }
+    }
+    pub fn short_label(&self) -> &str {
+        match self {
+            ConversionMethod::NMRPipe => "NMRPipe",
+            ConversionMethod::BuiltIn => "Built-in",
+        }
+    }
+}
+
 /// Acquisition mode for delta2pipe (-xMODE / -yMODE)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AcqMode {
@@ -181,6 +205,8 @@ pub struct ConversionSettings {
     pub verbose: bool,
     /// Extra raw arguments the user can type in
     pub extra_args: String,
+    /// Which conversion backend to use
+    pub conversion_method: ConversionMethod,
 }
 
 impl Default for ConversionSettings {
@@ -195,6 +221,7 @@ impl Default for ConversionSettings {
             ndim: 1,
             verbose: true,
             extra_args: String::new(),
+            conversion_method: ConversionMethod::NMRPipe,
         }
     }
 }
@@ -426,7 +453,9 @@ pub fn show_conversion_dialog(
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Reset to defaults").clicked() {
+                        let current_method = state.settings.conversion_method;
                         state.settings = ConversionSettings::default();
+                        state.settings.conversion_method = current_method;
                     }
                 });
             });

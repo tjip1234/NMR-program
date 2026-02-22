@@ -5,6 +5,20 @@ use egui_plot::{Line, Plot, PlotPoints, PlotUi, Points, Text, VLine};
 use crate::data::spectrum::{ExperimentType, Nucleus, SpectrumData};
 use crate::gui::phase_dialog::PhaseDialogState;
 
+/// An analysis action performed by a click in the spectrum view,
+/// to be logged by the app after the frame.
+#[derive(Debug, Clone)]
+pub enum SpectrumAction {
+    /// Manual peak picked at [ppm, intensity]
+    PeakAdded([f64; 2]),
+    /// Peak removed near ppm
+    PeakRemoved(f64),
+    /// Integration region defined (lo_ppm, hi_ppm, raw_integral)
+    IntegrationAdded(f64, f64, f64),
+    /// J-coupling measured (ppm1, ppm2, delta_ppm, j_hz)
+    JCouplingMeasured(f64, f64, f64, f64),
+}
+
 /// State for the spectrum viewer
 #[derive(Debug, Clone)]
 pub struct SpectrumViewState {
@@ -36,6 +50,8 @@ pub struct SpectrumViewState {
     pub show_j_couplings: bool,
     /// Incremented on auto-scale to give the plot a fresh ID (resets zoom)
     pub plot_generation: u32,
+    /// Pending actions from clicks, to be drained and logged by app.rs
+    pub pending_actions: Vec<SpectrumAction>,
 }
 
 impl Default for SpectrumViewState {
@@ -61,6 +77,7 @@ impl Default for SpectrumViewState {
             j_couplings: Vec::new(),
             show_j_couplings: true,
             plot_generation: 0,
+            pending_actions: Vec::new(),
         }
     }
 }
@@ -541,7 +558,14 @@ pub fn show_spectrum_1d(
                 // Find the intensity at each ppm to position the line
                 let y1 = find_intensity_at_ppm(primary_data, &ppm_scale, x1) * vert_scale;
                 let y2 = find_intensity_at_ppm(primary_data, &ppm_scale, x2) * vert_scale;
-                let bar_y = y1.max(y2) * 1.12;
+                // Position bar above the taller peak; handle negative intensities correctly
+                let y_top = y1.max(y2);
+                let bar_y = if y_top >= 0.0 {
+                    y_top * 1.12
+                } else {
+                    // Both peaks negative: place bar above (closer to zero)
+                    y_top * 0.88
+                };
 
                 // Draw a horizontal bar connecting the two peaks
                 let bar = Line::new(PlotPoints::from(vec![
@@ -553,7 +577,7 @@ pub fn show_spectrum_1d(
                 plot_ui.line(bar);
 
                 // Vertical tick marks at each end
-                let tick_h = bar_y * 0.03;
+                let tick_h = (bar_y.abs() * 0.03).max(0.001);
                 let t1 = Line::new(PlotPoints::from(vec![
                     [x1, bar_y - tick_h],
                     [x1, bar_y + tick_h],
@@ -571,8 +595,9 @@ pub fn show_spectrum_1d(
 
                 // Label: "J = X.X Hz"
                 let mid_x = (x1 + x2) / 2.0;
+                let label_y = if bar_y >= 0.0 { bar_y * 1.03 } else { bar_y + tick_h * 2.0 };
                 let label = Text::new(
-                    [mid_x, bar_y * 1.03].into(),
+                    [mid_x, label_y].into(),
                     egui::RichText::new(format!("J = {:.1} Hz", j_hz))
                         .size(10.0)
                         .color(colors.j_coupling_color),
@@ -622,7 +647,7 @@ pub fn show_spectrum_1d(
         }
     });
 
-    // ── Handle clicks: baseline picking + integration picking + J-coupling + peak picking ──
+    // ── Handle clicks: only ONE picking mode active at a time ──
     let any_picking = is_picking_bl || state.integration_picking || state.j_coupling_picking || state.peak_picking;
     if any_picking {
         if let Some(pos) = plot_resp.response.hover_pos() {
@@ -634,22 +659,20 @@ pub fn show_spectrum_1d(
 
                 if is_picking_bl {
                     state.baseline_points.push([real_x, coord.y]);
-                }
-
-                if state.peak_picking {
+                } else if state.peak_picking {
                     if shift_held {
                         // Shift+click: remove nearest peak within tolerance
                         remove_nearest_peak(&mut state.peaks, real_x, 0.1);
+                        state.pending_actions.push(SpectrumAction::PeakRemoved(real_x));
                     } else {
                         // Normal click: add peak at nearest local maximum
                         let peak = find_nearest_local_max(spectrum, real_x, &raw_ppm);
+                        state.pending_actions.push(SpectrumAction::PeakAdded(peak));
                         state.peaks.push(peak);
                         // Re-sort peaks by ppm descending
                         state.peaks.sort_by(|a, b| b[0].partial_cmp(&a[0]).unwrap());
                     }
-                }
-
-                if state.integration_picking {
+                } else if state.integration_picking {
                     if let Some(start) = state.integration_start.take() {
                         // Second click → compute integral
                         let lo = start.min(real_x);
@@ -657,13 +680,12 @@ pub fn show_spectrum_1d(
                         let raw_integral =
                             crate::pipeline::processing::integrate_region(spectrum, lo, hi);
                         state.integrations.push((lo, hi, raw_integral));
+                        state.pending_actions.push(SpectrumAction::IntegrationAdded(lo, hi, raw_integral));
                     } else {
                         // First click → mark start
                         state.integration_start = Some(real_x);
                     }
-                }
-
-                if state.j_coupling_picking {
+                } else if state.j_coupling_picking {
                     // Snap to nearest detected peak if possible
                     let snapped = snap_to_nearest_peak(real_x, &state.peaks, 0.05);
                     if let Some(first_ppm) = state.j_coupling_first.take() {
@@ -676,6 +698,7 @@ pub fn show_spectrum_1d(
                             .unwrap_or(400.0);
                         let j_hz = delta_ppm * obs_mhz;
                         state.j_couplings.push((first_ppm, snapped, delta_ppm, j_hz));
+                        state.pending_actions.push(SpectrumAction::JCouplingMeasured(first_ppm, snapped, delta_ppm, j_hz));
                     } else {
                         // First click
                         state.j_coupling_first = Some(snapped);

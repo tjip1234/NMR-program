@@ -7,6 +7,7 @@ pub enum VendorFormat {
     Bruker,
     Varian,
     Jeol,
+    Jcamp,
     NMRPipe,
     Unknown,
 }
@@ -17,6 +18,7 @@ impl std::fmt::Display for VendorFormat {
             VendorFormat::Bruker => write!(f, "Bruker"),
             VendorFormat::Varian => write!(f, "Varian/Agilent"),
             VendorFormat::Jeol => write!(f, "JEOL Delta"),
+            VendorFormat::Jcamp => write!(f, "JCAMP-DX"),
             VendorFormat::NMRPipe => write!(f, "NMRPipe"),
             VendorFormat::Unknown => write!(f, "Unknown"),
         }
@@ -139,12 +141,18 @@ pub struct SpectrumData {
     pub real: Vec<f64>,
     /// Imaginary data for 1D spectrum (if present)
     pub imag: Vec<f64>,
-    /// 2D data stored as flattened row-major (f2 is fast axis)
+    /// 2D real data stored as row-major (f2 is fast axis)
     pub data_2d: Vec<Vec<f64>>,
+    /// 2D imaginary data (same layout as data_2d)
+    #[serde(default)]
+    pub data_2d_imag: Vec<Vec<f64>>,
     /// Whether the data has been Fourier-transformed
     pub is_frequency_domain: bool,
     /// NMRPipe format file path after conversion
     pub nmrpipe_path: Option<PathBuf>,
+    /// Which conversion method was used to load the data
+    #[serde(default)]
+    pub conversion_method_used: String,
 }
 
 impl Default for SpectrumData {
@@ -159,8 +167,10 @@ impl Default for SpectrumData {
             real: Vec::new(),
             imag: Vec::new(),
             data_2d: Vec::new(),
+            data_2d_imag: Vec::new(),
             is_frequency_domain: false,
             nmrpipe_path: None,
+            conversion_method_used: String::new(),
         }
     }
 }
@@ -183,16 +193,17 @@ impl SpectrumData {
 /// Detect experiment type from filename
 pub fn detect_experiment_type(filename: &str) -> ExperimentType {
     let upper = filename.to_uppercase();
-    if upper.contains("PROTON") || upper.contains("1H") {
-        ExperimentType::Proton
-    } else if upper.contains("135") || upper.contains("DEPT") {
-        ExperimentType::Dept135
-    } else if upper.contains("HSQC") {
+    // Check 2D experiment names first (before 1H/13C which could be substrings)
+    if upper.contains("HSQC") {
         ExperimentType::Hsqc
     } else if upper.contains("HMBC") {
         ExperimentType::Hmbc
     } else if upper.contains("COSY") {
         ExperimentType::Cosy
+    } else if upper.contains("135") || upper.contains("DEPT") {
+        ExperimentType::Dept135
+    } else if upper.contains("PROTON") || upper.contains("1H") {
+        ExperimentType::Proton
     } else if upper.contains("CARBON") || upper.contains("13C") {
         ExperimentType::Carbon
     } else {

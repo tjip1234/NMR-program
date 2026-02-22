@@ -15,22 +15,27 @@ pub enum ToolbarAction {
     ExportLog,
     Undo,
     Redo,
-    ZoomIn,
-    ZoomOut,
     ZoomReset,
     ThemeToggle,
     ShowAbout,
+    ToggleConversionMethod,
 }
 
 /// Render the toolbar and return any triggered action
-pub fn show_toolbar(ctx: &egui::Context, theme_label: &str) -> ToolbarAction {
+pub fn show_toolbar(
+    ctx: &egui::Context,
+    theme_label: &str,
+    conversion_method_label: &str,
+    can_undo: bool,
+    can_redo: bool,
+) -> ToolbarAction {
     let mut action = ToolbarAction::None;
 
     egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
         egui::menu::bar(ui, |ui| {
             // File menu
             ui.menu_button("📁 File", |ui| {
-                if ui.button("📂 Open File…").clicked() {
+                if ui.button("📂 Open File…        Ctrl+O").clicked() {
                     action = ToolbarAction::OpenFile;
                     ui.close_menu();
                 }
@@ -39,7 +44,7 @@ pub fn show_toolbar(ctx: &egui::Context, theme_label: &str) -> ToolbarAction {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("💾 Save Project…").clicked() {
+                if ui.button("💾 Save Project…     Ctrl+S").clicked() {
                     action = ToolbarAction::SaveProject;
                     ui.close_menu();
                 }
@@ -52,11 +57,11 @@ pub fn show_toolbar(ctx: &egui::Context, theme_label: &str) -> ToolbarAction {
                     action = ToolbarAction::ExportImage;
                     ui.close_menu();
                 }
-                if ui.button("� Export Data…").clicked() {
+                if ui.button("📊 Export Data…").clicked() {
                     action = ToolbarAction::ExportData;
                     ui.close_menu();
                 }
-                if ui.button("�📋 Export Log…").clicked() {
+                if ui.button("📋 Export Log…").clicked() {
                     action = ToolbarAction::ExportLog;
                     ui.close_menu();
                 }
@@ -64,26 +69,22 @@ pub fn show_toolbar(ctx: &egui::Context, theme_label: &str) -> ToolbarAction {
 
             // Edit menu
             ui.menu_button("✏️ Edit", |ui| {
-                if ui.button("↩ Undo").clicked() {
-                    action = ToolbarAction::Undo;
-                    ui.close_menu();
-                }
-                if ui.button("↪ Redo").clicked() {
-                    action = ToolbarAction::Redo;
-                    ui.close_menu();
-                }
+                ui.add_enabled_ui(can_undo, |ui| {
+                    if ui.button("↩ Undo               Ctrl+Z").clicked() {
+                        action = ToolbarAction::Undo;
+                        ui.close_menu();
+                    }
+                });
+                ui.add_enabled_ui(can_redo, |ui| {
+                    if ui.button("↪ Redo               Ctrl+Shift+Z").clicked() {
+                        action = ToolbarAction::Redo;
+                        ui.close_menu();
+                    }
+                });
             });
 
             // View menu
             ui.menu_button("🔍 View", |ui| {
-                if ui.button("🔍+ Zoom In").clicked() {
-                    action = ToolbarAction::ZoomIn;
-                    ui.close_menu();
-                }
-                if ui.button("🔍− Zoom Out").clicked() {
-                    action = ToolbarAction::ZoomOut;
-                    ui.close_menu();
-                }
                 if ui.button("🔄 Reset Zoom").clicked() {
                     action = ToolbarAction::ZoomReset;
                     ui.close_menu();
@@ -91,6 +92,14 @@ pub fn show_toolbar(ctx: &egui::Context, theme_label: &str) -> ToolbarAction {
                 ui.separator();
                 if ui.button(format!("🎨 Theme: {}", theme_label)).clicked() {
                     action = ToolbarAction::ThemeToggle;
+                    ui.close_menu();
+                }
+            });
+
+            // Settings menu
+            ui.menu_button("⚙ Settings", |ui| {
+                if ui.button(format!("🔄 Conversion: {}", conversion_method_label)).clicked() {
+                    action = ToolbarAction::ToggleConversionMethod;
                     ui.close_menu();
                 }
             });
@@ -129,6 +138,7 @@ pub fn open_file_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Open NMR Data File")
         .add_filter("JEOL Delta", &["jdf"])
+        .add_filter("JCAMP-DX", &["jdx", "dx", "jcamp"])
         .add_filter("NMRPipe", &["fid", "ft1", "ft2"])
         .add_filter("All Files", &["*"])
         .pick_file()
