@@ -1,0 +1,10 @@
+[package]
+name = "nmrpipe-core"
+description = "Core NMRPipe format types: FDATA header, enums, and parameter access"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+byteorder = { workspace = true }

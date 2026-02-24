@@ -1,0 +1,13 @@
+[package]
+name = "bruk2pipe"
+description = "Bruker to NMRPipe format converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nmrpipe-core = { workspace = true }
+nmrpipe-io = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+rustfft = { workspace = true }

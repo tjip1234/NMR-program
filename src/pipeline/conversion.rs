@@ -12,6 +12,7 @@ use crate::data::jdf;
 use crate::data::nmrpipe_format;
 use crate::data::bruker;
 use crate::data::jcamp;
+use crate::data::native_converter;
 use crate::gui::conversion_dialog::{ConversionMethod, ConversionSettings};
 use crate::log::reproducibility::ReproLog;
 use super::command::NmrPipeCommand;
@@ -81,11 +82,10 @@ fn conversion_output_dir(source: &Path) -> PathBuf {
     parent.join(format!("{}_nmrpipe", stem))
 }
 
-/// Convert a JEOL .jdf file to NMRPipe format using delta2pipe.
+/// Convert a JEOL .jdf file to NMRPipe format.
 ///
-/// Shells out to NMRPipe's `delta2pipe` tool which correctly handles
-/// the proprietary JEOL Delta binary format.
-/// With BuiltIn method, returns an error since JEOL has no native reader.
+/// With BuiltIn method, uses the native `delta2pipe` library crate directly.
+/// With NMRPipe method, shells out to NMRPipe's external `delta2pipe` tool.
 fn convert_jeol(path: &Path, log: &mut ReproLog, settings: &ConversionSettings) -> io::Result<SpectrumData> {
     log.add_entry(
         "Format Detection",
@@ -94,12 +94,55 @@ fn convert_jeol(path: &Path, log: &mut ReproLog, settings: &ConversionSettings) 
     );
 
     if settings.conversion_method == ConversionMethod::BuiltIn {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "JEOL Delta (.jdf) files require NMRPipe's delta2pipe for conversion.\n\
-             Switch to NMRPipe mode to load this format.",
-        ));
+        return convert_jeol_builtin(path, log, settings);
     }
+
+    // NMRPipe external tool path
+    convert_jeol_nmrpipe(path, log, settings)
+}
+
+/// Convert JEOL .jdf using the native delta2pipe library (no external tools).
+fn convert_jeol_builtin(path: &Path, log: &mut ReproLog, settings: &ConversionSettings) -> io::Result<SpectrumData> {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "data".to_string());
+
+    // Map ConversionSettings to native options
+    let native_opts = native_converter::NativeJeolOptions {
+        real_only: settings.df_mode == crate::gui::conversion_dialog::DfMode::RealOnly,
+        apply_df: matches!(settings.df_mode, crate::gui::conversion_dialog::DfMode::During),
+        df_val: None,
+        verbose: settings.verbose,
+    };
+
+    let mut spectrum = native_converter::convert_jdf_native(path, &native_opts)?;
+
+    // Detect experiment type from filename
+    let experiment_type = crate::data::spectrum::detect_experiment_type(&stem);
+    spectrum.experiment_type = experiment_type;
+    spectrum.sample_name = stem.clone();
+
+    log.add_entry(
+        "Conversion (native delta2pipe)",
+        &format!(
+            "Converted JEOL Delta to NMR data\n\
+             # Method: Built-in (native Rust)\n\
+             # Source: {}\n\
+             # Points: {}\n\
+             # Dimensions: {}",
+            path.display(),
+            spectrum.real.len(),
+            if spectrum.is_2d() { "2D" } else { "1D" },
+        ),
+        "# built-in native delta2pipe — no external tools required",
+    );
+
+    Ok(spectrum)
+}
+
+/// Convert JEOL .jdf using the external NMRPipe delta2pipe tool.
+fn convert_jeol_nmrpipe(path: &Path, log: &mut ReproLog, settings: &ConversionSettings) -> io::Result<SpectrumData> {
 
     // Check delta2pipe availability
     if jdf::find_delta2pipe().is_none() {
@@ -257,39 +300,77 @@ fn convert_bruker_nmrpipe(path: &Path, log: &mut ReproLog) -> io::Result<Spectru
     Ok(spectrum)
 }
 
-/// Read Bruker data using built-in native reader
+/// Read Bruker data using built-in native converter/reader.
+///
+/// First tries the native bruk2pipe library for raw FID/SER data,
+/// falls back to the simple Bruker reader for processed data.
 fn convert_bruker_builtin(path: &Path, log: &mut ReproLog) -> io::Result<SpectrumData> {
-    // Try processed data first (pdata/1/1r), then raw FID
-    let spectrum = if path.join("pdata/1/1r").exists() || path.join("pdata").join("1").join("1r").exists() {
+    // Try processed data first if raw files are missing or if processed exists
+    let has_raw = path.join("fid").exists() || path.join("ser").exists();
+    let has_processed = path.join("pdata/1/1r").exists()
+        || path.join("pdata").join("1").join("1r").exists();
+
+    if has_raw {
+        // Use the native bruk2pipe converter for raw data
+        log.add_entry(
+            "Load (native bruk2pipe)",
+            &format!("Converting Bruker raw data with native bruk2pipe\n\
+                      # Method: Built-in (native Rust)\n# Source: {}", path.display()),
+            "# built-in native bruk2pipe — no external tools required",
+        );
+
+        match native_converter::convert_bruker_native(path) {
+            Ok(spectrum) => {
+                log.add_entry(
+                    "Load (native bruk2pipe)",
+                    &format!(
+                        "Loaded: {} real pts, {}, {} {}",
+                        spectrum.real.len(),
+                        spectrum.axes.first().map(|a| a.nucleus.to_string()).unwrap_or_default(),
+                        if spectrum.is_frequency_domain { "freq domain" } else { "time domain" },
+                        if spectrum.is_2d() { "(2D)" } else { "(1D)" },
+                    ),
+                    "",
+                );
+                return Ok(spectrum);
+            }
+            Err(e) => {
+                log::warn!("Native bruk2pipe failed: {}, trying simple reader fallback", e);
+                if !has_processed {
+                    return Err(e);
+                }
+                // Fall through to simple reader below
+            }
+        }
+    }
+
+    if has_processed {
         log.add_entry(
             "Load (built-in Bruker reader)",
             &format!("Reading Bruker processed data natively\n\
                       # Method: Built-in\n# Source: {}", path.display()),
             "# built-in reader — no NMRPipe required",
         );
-        bruker::read_bruker_processed(path)?
-    } else {
+        let spectrum = bruker::read_bruker_processed(path)?;
+
         log.add_entry(
             "Load (built-in Bruker reader)",
-            &format!("Reading Bruker raw FID natively\n\
-                      # Method: Built-in\n# Source: {}", path.display()),
-            "# built-in reader — no NMRPipe required",
+            &format!(
+                "Loaded: {} points, {}, {}",
+                spectrum.real.len(),
+                spectrum.axes.first().map(|a| a.nucleus.to_string()).unwrap_or_default(),
+                if spectrum.is_frequency_domain { "frequency domain" } else { "time domain" },
+            ),
+            "",
         );
-        bruker::read_bruker_fid(path)?
-    };
+        return Ok(spectrum);
+    }
 
-    log.add_entry(
-        "Load (built-in Bruker reader)",
-        &format!(
-            "Loaded: {} points, {}, {}",
-            spectrum.real.len(),
-            spectrum.axes.first().map(|a| a.nucleus.to_string()).unwrap_or_default(),
-            if spectrum.is_frequency_domain { "frequency domain" } else { "time domain" },
-        ),
-        "",
-    );
-
-    Ok(spectrum)
+    // No raw or processed data found
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("No convertible Bruker data (fid/ser/1r) in {}", path.display()),
+    ))
 }
 
 /// Convert Varian/Agilent data to NMRPipe format using var2pipe

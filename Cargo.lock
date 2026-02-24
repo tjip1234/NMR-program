@@ -694,6 +694,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bruk2pipe"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "nmrpipe-core",
+ "nmrpipe-io",
+ "rustfft",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1031,16 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "delta2pipe"
+version = "0.1.0"
+dependencies = [
+ "nmrpipe-core",
+ "nmrpipe-io",
+ "rustfft",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "digest"
@@ -2417,10 +2438,12 @@ dependencies = [
 
 [[package]]
 name = "nmr_gui"
-version = "0.1.0"
+version = "0.12.0"
 dependencies = [
+ "bruk2pipe",
  "byteorder",
  "chrono",
+ "delta2pipe",
  "eframe",
  "egui",
  "egui_extras",
@@ -2428,12 +2451,33 @@ dependencies = [
  "env_logger",
  "image",
  "log",
+ "nmrpipe-core",
+ "nmrpipe-io",
  "num-complex",
  "rfd",
  "rustfft",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "nmrpipe-core"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nmrpipe-io"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "nmrpipe-core",
+ "rustfft",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

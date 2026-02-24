@@ -513,6 +513,23 @@ fn show_image_preview(
     view_state: &SpectrumViewState,
     settings: &ImageExportSettings,
 ) {
+    // Show notice for 2D data
+    if spectrum.is_2d() {
+        ui.label(
+            egui::RichText::new("⚠ 2D spectrum — image export shows the F2 projection (1D trace)")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
+        );
+        ui.add_space(2.0);
+    }
+
+    if spectrum.real.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label("No 1D data available for export preview");
+        });
+        return;
+    }
+
     // ── Data preparation (identical to export) ──
     let ppm_scale = if spectrum.is_frequency_domain && !spectrum.axes.is_empty() {
         spectrum.axes[0].ppm_scale()
@@ -1004,6 +1021,16 @@ fn show_data_preview(
     view_state: &SpectrumViewState,
     settings: &DataExportSettings,
 ) {
+    // Show notice for 2D data
+    if spectrum.is_2d() {
+        ui.label(
+            egui::RichText::new("⚠ 2D spectrum — data export shows 1D analysis results only")
+                .size(11.0)
+                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
+        );
+        ui.add_space(2.0);
+    }
+
     let sep = match settings.format {
         0 => ",",
         1 => "\t",

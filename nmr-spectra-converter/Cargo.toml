@@ -1,0 +1,48 @@
+[package]
+name = "nmr-spectra-converter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Convert NMR vendor data (JEOL Delta, Bruker) to NMRPipe format"
+authors = ["NMR Spectra Converter contributors"]
+readme = "README.md"
+
+[workspace]
+members = [
+    "crates/nmrpipe-core",
+    "crates/nmrpipe-io",
+    "crates/delta2pipe",
+    "crates/bruk2pipe",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+nmrpipe-core = { path = "crates/nmrpipe-core" }
+nmrpipe-io = { path = "crates/nmrpipe-io" }
+delta2pipe = { path = "crates/delta2pipe" }
+bruk2pipe = { path = "crates/bruk2pipe" }
+thiserror = "1"
+byteorder = "1"
+rustfft = "6"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "delta2pipe"
+path = "src/bin/delta2pipe.rs"
+
+[[bin]]
+name = "bruk2pipe"
+path = "src/bin/bruk2pipe.rs"
+
+[dependencies]
+nmrpipe-core = { workspace = true }
+nmrpipe-io = { workspace = true }
+delta2pipe = { workspace = true }
+bruk2pipe = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }

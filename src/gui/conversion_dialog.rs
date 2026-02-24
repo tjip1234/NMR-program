@@ -221,7 +221,7 @@ impl Default for ConversionSettings {
             ndim: 1,
             verbose: true,
             extra_args: String::new(),
-            conversion_method: ConversionMethod::NMRPipe,
+            conversion_method: ConversionMethod::BuiltIn,
         }
     }
 }

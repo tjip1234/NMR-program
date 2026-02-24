@@ -4,7 +4,7 @@
 
 A desktop NMR spectral processing app written in Rust with [egui](https://github.com/emilk/egui). Drag in your FID, click some buttons, get a spectrum. Every single operation is logged so you (or your PI) can reproduce exactly what happened.
 
-NMRPipe can be used as a backend if installed and in the $PATH$, but the app runs perfectly fine without it using built-in Rust implementations..... or does it? 
+NMRPipe can be used as a backend if installed and in the $PATH$, but the app runs perfectly fine without it using built-in Rust implementations — and as of v0.12, it really does. Native Rust converters (ported from `delta2pipe` and `bruk2pipe`) handle JEOL and Bruker formats directly, no external tools needed.
 
 ![Example 1H export](example.svg)
 
@@ -25,7 +25,7 @@ Pre-built binaries are attached to [Releases](../../releases) when a version tag
 ## Features
 
 ### What it does
-- **Auto-detection** — figures out the vendor format and converts to NMRPipe internally, probably
+- **Auto-detection** — figures out the vendor format and converts using built-in native converters (or NMRPipe if you prefer)
 - **1D processing** — apodization (EM, GM, sine/cosine bell), zero fill, FFT, phase correction, baseline correction, solvent suppression
 - **2D contour plots** — NOT YET 
 - **Interactive phasing** — click-and-drag PH0/PH1, or hit auto-phase and hope for the best
@@ -80,11 +80,11 @@ The binary ends up in `target/release/nmr_gui` (or `nmr_gui.exe` on Windows).
 
 ### Cross-compilation note
 
-The GitHub Actions workflow in [.github/workflows/build.yml](.github/workflows/build.yml) handles building for all three platforms automatically. Push a tag like `v0.1.0` to create a release with downloadable binaries.
+The GitHub Actions workflow in [.github/workflows/build.yml](.github/workflows/build.yml) handles building for all three platforms automatically. Push a tag like `v0.12.0` to create a release with downloadable binaries.
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.12.0
+git push origin v0.12.0
 ```
 
 ---
@@ -106,8 +106,10 @@ Works in two modes:
 
 | Mode | Status bar | What happens |
 |---|---|---|
-| **NMRPipe installed** | 🟢 NMRPipe | Uses `bruk2pipe`, `var2pipe` for conversion; subprocess calls for processing |
-| **Without NMRPipe** | 🟡 Built-in mode | Pure Rust implementations for everything;|
+| **Built-in (default)** | 🟢 Built-in | Native Rust converters (`delta2pipe`, `bruk2pipe` ports) + pure Rust processing — no external tools needed |
+| **NMRPipe tools** | 🟢 NMRPipe | Uses external `bruk2pipe`, `delta2pipe`, `var2pipe` for conversion; subprocess calls for processing |
+
+As of **v0.12**, Built-in mode is the default. JEOL Delta (`.jdf`) and Bruker formats are converted natively without shelling out to NMRPipe. You can switch to NMRPipe mode in the conversion dialog if needed.
 
 The reproducibility log records NMRPipe-equivalent commands regardless of which mode is used, so the output is always reproducible.
 
@@ -121,8 +123,17 @@ src/
 ├── app.rs                      # Application state, eframe::App, export rendering
 ├── data/
 │   ├── spectrum.rs             # SpectrumData, AxisParams, core types
-│   ├── jdf.rs                  # JEOL Delta (.jdf) native reader
+│   ├── native_converter.rs     # Bridge: delta2pipe/bruk2pipe crates → SpectrumData
+│   ├── jdf.rs                  # JEOL Delta (.jdf) external tool interface
+│   ├── bruker.rs               # Bruker acqus parsing & external tool interface
+│   ├── jcamp.rs                # JCAMP-DX reader
 │   └── nmrpipe_format.rs       # NMRPipe format reader/writer
+nmr-spectra-converter/          # Native converter crates (JEOL & Bruker)
+│   └── crates/
+│       ├── nmrpipe-core/       # NMRPipe FDATA header types & parameter access
+│       ├── nmrpipe-io/         # NMRPipe binary I/O & digital filter correction
+│       ├── delta2pipe/         # JEOL Delta → NMRPipe conversion (pure Rust)
+│       └── bruk2pipe/          # Bruker SER/FID → NMRPipe conversion (pure Rust)
 ├── pipeline/
 │   ├── command.rs              # NMRPipe subprocess abstraction
 │   ├── conversion.rs           # Format detection & auto-conversion
@@ -151,6 +162,9 @@ src/
 | Image export | `image` |
 | Serialization | `serde` + `serde_json` |
 | File dialogs | `rfd` |
+| JEOL conversion | `delta2pipe` (native Rust port) |
+| Bruker conversion | `bruk2pipe` (native Rust port) |
+| NMRPipe types | `nmrpipe-core` + `nmrpipe-io` |
 
 ---
 

@@ -1,0 +1,12 @@
+[package]
+name = "nmrpipe-io"
+description = "Binary I/O, byte-swapping, and type conversion utilities for NMR data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nmrpipe-core = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+rustfft = { workspace = true }

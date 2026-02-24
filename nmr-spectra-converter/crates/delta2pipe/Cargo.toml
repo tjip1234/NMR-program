@@ -1,0 +1,12 @@
+[package]
+name = "delta2pipe"
+description = "JEOL Delta to NMRPipe format converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nmrpipe-core = { workspace = true }
+nmrpipe-io = { workspace = true }
+thiserror = { workspace = true }
+rustfft = { workspace = true }

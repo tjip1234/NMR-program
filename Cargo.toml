@@ -1,8 +1,8 @@
 [package]
 name = "nmr_gui"
-version = "0.1.0"
+version = "0.12.0"
 edition = "2021"
-description = "NMR Spectral Processing GUI with NMRPipe backend"
+description = "NMR Spectral Processing GUI with native format conversion"
 
 [dependencies]
 eframe = { version = "0.31", features = ["default"] }
@@ -20,3 +20,10 @@ image = "0.25"
 log = "0.4"
 env_logger = "0.11"
 uuid = { version = "1", features = ["v4"] }
+thiserror = "1"
+
+# Native NMR converter libraries (local path dependencies)
+nmrpipe-core = { path = "nmr-spectra-converter/crates/nmrpipe-core" }
+nmrpipe-io   = { path = "nmr-spectra-converter/crates/nmrpipe-io" }
+delta2pipe   = { path = "nmr-spectra-converter/crates/delta2pipe" }
+bruk2pipe    = { path = "nmr-spectra-converter/crates/bruk2pipe" }
