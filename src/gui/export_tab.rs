@@ -513,14 +513,9 @@ fn show_image_preview(
     view_state: &SpectrumViewState,
     settings: &ImageExportSettings,
 ) {
-    // Show notice for 2D data
     if spectrum.is_2d() {
-        ui.label(
-            egui::RichText::new("⚠ 2D spectrum — image export shows the F2 projection (1D trace)")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
-        );
-        ui.add_space(2.0);
+        show_image_preview_2d(ui, spectrum, view_state, settings);
+        return;
     }
 
     if spectrum.real.is_empty() {
@@ -633,6 +628,7 @@ fn show_image_preview(
     let font_lg = (16.0 * fs * scale).max(9.0);
     let font_md = (12.0 * fs * scale).max(8.0);
     let marker_r = (4.0 * ms * scale).max(1.5);
+    let row_gap = (3.0 * scale).max(2.0);
 
     // ── Coordinate helpers ──
     let ppm_to_x = |ppm: f64| -> f32 {
@@ -660,6 +656,56 @@ fn show_image_preview(
                 egui::Stroke::new(0.5, grid_color),
             );
             tick += tick_step;
+        }
+    }
+
+    // ── Integration Backgrounds (AUC shading, Draw BEFORE spectrum) ──
+    if settings.show_integrations && !view_state.integrations.is_empty() {
+        let int_color = egui::Color32::from_rgb(76, 175, 80);
+        let fill_color = int_color.gamma_multiply(0.12);
+        let y_base = val_to_y(0.0);
+
+        for &(start_ppm, end_ppm, _) in &view_state.integrations {
+            let lo = start_ppm.min(end_ppm).max(ppm_lo);
+            let hi = start_ppm.max(end_ppm).min(ppm_hi);
+            if lo >= hi {
+                continue;
+            }
+
+            // Draw as a series of quads (trapezoids) for each trace segment
+            // This is more robust than a single convex_polygon for non-convex traces
+            for i in 0..n.saturating_sub(1) {
+                let p1 = ppm_scale[i];
+                let p2 = ppm_scale[i+1];
+                
+                // If segment overlaps the integration range
+                let s_lo = p1.min(p2);
+                let s_hi = p1.max(p2);
+                if s_hi < lo || s_lo > hi { continue; }
+
+                // Clamp segment quads to integration bounds
+                let q_lo = s_lo.max(lo);
+                let q_hi = s_hi.min(hi);
+
+                let x1 = ppm_to_x(q_hi);
+                let x2 = ppm_to_x(q_lo);
+                
+                let y1_val = if clip { spectrum.real[i].max(0.0) } else { spectrum.real[i] };
+                let y2_val = if clip { spectrum.real[i+1].max(0.0) } else { spectrum.real[i+1] };
+                let y1 = val_to_y(y1_val);
+                let y2 = val_to_y(y2_val);
+
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(x1, y_base),
+                        egui::pos2(x1, y1),
+                        egui::pos2(x2, y2),
+                        egui::pos2(x2, y_base),
+                    ],
+                    fill_color,
+                    egui::Stroke::NONE,
+                ));
+            }
         }
     }
 
@@ -708,7 +754,7 @@ fn show_image_preview(
         egui::epaint::StrokeKind::Outside,
     );
 
-    // ── Peak markers with collision-avoidant labels ──
+    // ── Peak markers with single-row labels & non-crossing kinked leaders ──
     if settings.show_peaks && !view_state.peaks.is_empty() {
         let peak_color = egui::Color32::from_rgb(0xD0, 0x30, 0x30);
         let leader_color = egui::Color32::from_rgb(0xC8, 0x78, 0x78);
@@ -719,7 +765,6 @@ fn show_image_preview(
             py: f32,
             text: String,
             rect: egui::Rect,
-            natural_y: f32,
         }
 
         let mut labels: Vec<PLabel> = view_state
@@ -734,72 +779,97 @@ fn show_image_preview(
                 let galley = painter.layout_no_wrap(text.clone(), font.clone(), peak_color);
                 let tw = galley.size().x;
                 let th = galley.size().y;
-                let lx = px - tw / 2.0;
-                let ly = py - marker_r * 3.5 - th - 2.0;
+                let ly = plot_rect.top() + row_gap;
                 PLabel {
                     px,
                     py,
                     text,
                     rect: egui::Rect::from_min_size(
-                        egui::pos2(lx, ly),
+                        egui::pos2(px - tw / 2.0, ly),
                         egui::vec2(tw, th),
                     ),
-                    natural_y: ly,
                 }
             })
             .collect();
 
-        // Collision avoidance — sort by x, shift overlapping labels up
-        labels.sort_by(|a, b| {
-            a.rect
-                .left()
-                .partial_cmp(&b.rect.left())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let pad = 3.0_f32;
-        // Multi-pass collision avoidance: repeat until stable or max passes
-        for _pass in 0..5 {
-            let mut any_moved = false;
-            for i in 0..labels.len() {
-                for _iter in 0..20 {
-                    let mut needs_shift = false;
-                    let mut shift_to = f32::MAX;
-                    let ri = labels[i].rect.expand(pad);
-                    for j in 0..labels.len() {
-                        if j == i {
-                            continue;
+        // Sort by peak X then resolve horizontal overlaps via order-preserving sweep
+        labels.sort_by(|a, b| a.px.partial_cmp(&b.px).unwrap_or(std::cmp::Ordering::Equal));
+
+        let pad = (2.0 * scale).max(1.0);
+        for _pass in 0..10 {
+            let mut moved = false;
+            for i in 1..labels.len() {
+                let prev_right = labels[i - 1].rect.right() + pad;
+                if labels[i].rect.left() < prev_right {
+                    let push = prev_right - labels[i].rect.left();
+                    labels[i].rect = labels[i].rect.translate(egui::vec2(push, 0.0));
+                    moved = true;
+                }
+            }
+            for i in (0..labels.len().saturating_sub(1)).rev() {
+                let next_left = labels[i + 1].rect.left() - pad;
+                if labels[i].rect.right() > next_left {
+                    let push = labels[i].rect.right() - next_left;
+                    labels[i].rect = labels[i].rect.translate(egui::vec2(-push, 0.0));
+                    moved = true;
+                }
+            }
+            if !moved { break; }
+        }
+
+        // Clamp block to plot bounds
+        let block_left = labels.first().map(|l| l.rect.left()).unwrap_or(0.0);
+        let block_right = labels.last().map(|l| l.rect.right()).unwrap_or(0.0);
+        let block_w = block_right - block_left;
+        if block_w > plot_rect.width() {
+            for l in &mut labels {
+                if l.rect.left() < plot_rect.left() {
+                    l.rect = l.rect.translate(egui::vec2(plot_rect.left() - l.rect.left(), 0.0));
+                }
+                if l.rect.right() > plot_rect.right() {
+                    l.rect = l.rect.translate(egui::vec2(plot_rect.right() - l.rect.right(), 0.0));
+                }
+            }
+        } else if block_left < plot_rect.left() {
+            let shift = plot_rect.left() - block_left;
+            for l in &mut labels { l.rect = l.rect.translate(egui::vec2(shift, 0.0)); }
+        } else if block_right > plot_rect.right() {
+            let shift = plot_rect.right() - block_right;
+            for l in &mut labels { l.rect = l.rect.translate(egui::vec2(shift, 0.0)); }
+        }
+
+        // Per-label knee level via iterative refinement. Knees sit BELOW the
+        // labels (in the whitespace between labels and peaks). If leader i's
+        // horizontal passes over peak[j].px, peak j's vertical (peak → up to
+        // knee[j]) must clear leader i's horizontal — meaning knee_y[j] sits
+        // ABOVE knee_y[i] in screen coords → level[j] > level[i].
+        let n = labels.len();
+        let mut level = vec![0_i32; n];
+        for _ in 0..n.max(1) {
+            let mut changed = false;
+            for i in 0..n {
+                let label_cx = labels[i].rect.center().x;
+                let lo = labels[i].px.min(label_cx);
+                let hi = labels[i].px.max(label_cx);
+                for j in 0..n {
+                    if i == j { continue; }
+                    if labels[j].px > lo && labels[j].px < hi {
+                        let needed = level[i] + 1;
+                        if level[j] < needed {
+                            level[j] = needed;
+                            changed = true;
                         }
-                        let rj = labels[j].rect.expand(pad);
-                        if ri.intersects(rj) {
-                            let target = rj.top() - labels[i].rect.height() - pad * 2.0;
-                            if target < shift_to {
-                                shift_to = target;
-                            }
-                            needs_shift = true;
-                        }
-                    }
-                    if needs_shift {
-                        // Clamp so labels don't go above the title
-                        let min_y = canvas.top() + font_lg + 4.0;
-                        let sz = labels[i].rect.size();
-                        labels[i].rect = egui::Rect::from_min_size(
-                            egui::pos2(labels[i].rect.left(), shift_to.max(min_y)),
-                            sz,
-                        );
-                        any_moved = true;
-                    } else {
-                        break;
                     }
                 }
             }
-            if !any_moved {
-                break;
-            }
+            if !changed { break; }
         }
 
-        // Draw markers, leader lines, labels
-        for pl in &labels {
-            // Triangle marker
+        let knee_step = (3.0 * scale).max(2.0);
+        let knee_gap = (4.0 * scale).max(2.0); // gap between label bottom and the first knee
+
+        // ── Draw ──
+        for (i, pl) in labels.iter().enumerate() {
             let tri_bot = pl.py - marker_r * 1.5;
             let tri_top = pl.py - marker_r * 3.5;
             painter.add(egui::Shape::convex_polygon(
@@ -812,18 +882,24 @@ fn show_image_preview(
                 egui::Stroke::NONE,
             ));
 
-            // Leader line if label was displaced
-            if pl.rect.top() < pl.natural_y - 3.0 {
-                painter.line_segment(
-                    [
-                        egui::pos2(pl.px, pl.rect.bottom() + 1.0),
-                        egui::pos2(pl.px, tri_top),
-                    ],
-                    egui::Stroke::new(0.5, leader_color),
-                );
-            }
+            let label_x = pl.rect.center().x;
+            let label_bottom = pl.rect.bottom();
+            // Knee sits below the label; higher levels (further from label)
+            // sit progressively lower toward the peaks.
+            let knee_y = (label_bottom + knee_gap + level[i] as f32 * knee_step)
+                .min(tri_top - 1.0)
+                .max(label_bottom + 1.0);
 
-            // Label text
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(pl.px, tri_top),
+                    egui::pos2(pl.px, knee_y),
+                    egui::pos2(label_x, knee_y),
+                    egui::pos2(label_x, label_bottom),
+                ],
+                egui::Stroke::new(0.5, leader_color),
+            ));
+
             painter.text(
                 pl.rect.left_top(),
                 egui::Align2::LEFT_TOP,
@@ -833,6 +909,7 @@ fn show_image_preview(
             );
         }
     }
+
 
     // ── Below-plot stacked labels ──
     let tick_step = preview_tick_step(x_range);
@@ -1002,7 +1079,7 @@ fn show_image_preview(
 
 /// Pick a nice tick step for axis labels.
 fn preview_tick_step(range: f64) -> f64 {
-    let nice_steps = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0];
+    let nice_steps = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
     let target_ticks = 10.0;
     let raw_step = range / target_ticks;
     for &step in &nice_steps {
@@ -1010,7 +1087,177 @@ fn preview_tick_step(range: f64) -> f64 {
             return step;
         }
     }
-    50.0
+    100.0
+}
+
+fn show_image_preview_2d(
+    ui: &mut egui::Ui,
+    spectrum: &SpectrumData,
+    _view_state: &SpectrumViewState,
+    settings: &ImageExportSettings,
+) {
+    if spectrum.data_2d.is_empty() || spectrum.axes.len() < 2 {
+        ui.centered_and_justified(|ui| {
+            ui.label("No 2D data available for export preview");
+        });
+        return;
+    }
+
+    let ppm_f2 = spectrum.axes[0].ppm_scale();
+    let ppm_f1 = spectrum.axes[1].ppm_scale();
+
+    // Horizontal (F2) range
+    let (f2_hi, f2_lo) = if settings.use_custom_range {
+        (
+            settings.ppm_start.max(settings.ppm_end),
+            settings.ppm_start.min(settings.ppm_end),
+        )
+    } else {
+        (
+            ppm_f2.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            ppm_f2.iter().cloned().fold(f64::INFINITY, f64::min),
+        )
+    };
+    
+    // Vertical (F1) range - for simplicity, use full range or a heuristic
+    let f1_hi = ppm_f1.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let f1_lo = ppm_f1.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    let x_range = (f2_hi - f2_lo).max(1e-6);
+    let y_range = (f1_hi - f1_lo).max(1e-6);
+
+    // ── Allocate preview rect ──
+    let aspect = settings.width as f32 / settings.height as f32;
+    let avail = ui.available_size();
+    let pw = avail.x.min(avail.y * aspect);
+    let ph = (pw / aspect).min(avail.y);
+
+    let (response, painter) = ui.allocate_painter(egui::vec2(pw, ph), egui::Sense::hover());
+    let canvas = response.rect;
+    painter.rect_filled(canvas, 0.0, egui::Color32::WHITE);
+
+    // Margins
+    let ml = (pw * 0.10).max(40.0); // More space on left for F1 axis
+    let mr = (pw * 0.04).max(15.0);
+    let mt = (ph * 0.08).max(20.0);
+    let mb = (ph * 0.12).max(30.0);
+
+    let plot_rect = egui::Rect::from_min_max(
+        egui::pos2(canvas.left() + ml, canvas.top() + mt),
+        egui::pos2(canvas.right() - mr, canvas.bottom() - mb),
+    );
+
+    if plot_rect.width() < 10.0 || plot_rect.height() < 10.0 { return; }
+
+    // Downsample for preview performance
+    let preview_rows = 128_usize;
+    let preview_cols = 128_usize;
+    
+    let n_f1 = spectrum.data_2d.len();
+    let n_f2 = spectrum.data_2d[0].len();
+    
+    let r_step = (n_f1 / preview_rows).max(1);
+    let c_step = (n_f2 / preview_cols).max(1);
+
+    // Find max in visible range for normalization
+    let mut max_val = 1e-12;
+    for r in (0..n_f1).step_by(r_step) {
+        let p_f1 = ppm_f1[r];
+        if p_f1 < f1_lo || p_f1 > f1_hi { continue; }
+        for c in (0..n_f2).step_by(c_step) {
+            let p_f2 = ppm_f2[c];
+            if p_f2 < f2_lo || p_f2 > f2_hi { continue; }
+            let v = spectrum.data_2d[r][c].abs();
+            if v > max_val { max_val = v; }
+        }
+    }
+
+    // Draw heatmap cells
+    let cell_w = plot_rect.width() / (n_f2 as f32 / c_step as f32);
+    let cell_h = plot_rect.height() / (n_f1 as f32 / r_step as f32);
+
+    for r in (0..n_f1).step_by(r_step) {
+        let p_f1 = ppm_f1[r];
+        if p_f1 < f1_lo || p_f1 > f1_hi { continue; }
+        
+        let y_frac = (f1_hi - p_f1) / y_range;
+        let py = plot_rect.top() + y_frac as f32 * plot_rect.height();
+
+        for c in (0..n_f2).step_by(c_step) {
+            let p_f2 = ppm_f2[c];
+            if p_f2 < f2_lo || p_f2 > f2_hi { continue; }
+            
+            let x_frac = (f2_hi - p_f2) / x_range;
+            let px = plot_rect.left() + x_frac as f32 * plot_rect.width();
+
+            let val = spectrum.data_2d[r][c].abs();
+            if val < max_val * 0.05 { continue; } // Noise floor
+
+            let intensity = (val / max_val).sqrt() as f32; // Square root scale for better dynamic range
+            
+            // Simple blue-to-red heatmap
+            let color = if spectrum.data_2d[r][c] >= 0.0 {
+                egui::Color32::from_rgb(
+                    (255.0 * intensity) as u8,
+                    (100.0 * (1.0 - intensity)) as u8,
+                    (200.0 * (1.0 - intensity)) as u8,
+                )
+            } else {
+                egui::Color32::from_rgb(
+                    (100.0 * (1.0 - intensity)) as u8,
+                    (100.0 * (1.0 - intensity)) as u8,
+                    (255.0 * intensity) as u8,
+                )
+            };
+
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(px, py), egui::vec2(cell_w, cell_h)),
+                0.0,
+                color,
+            );
+        }
+    }
+
+    // Border
+    painter.rect_stroke(plot_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK), egui::epaint::StrokeKind::Outside);
+
+    // Labels & Ticks
+    let scale = pw / settings.width as f32;
+    let fs = settings.font_scale;
+    let font_md = (12.0 * fs * scale).max(8.0);
+    let tick_font = egui::FontId::proportional(font_md);
+    let label_font = egui::FontId::proportional(font_md + 2.0);
+
+    // F2 Axis (Horizontal)
+    let f2_step = preview_tick_step(x_range);
+    let mut tick = (f2_lo / f2_step).ceil() * f2_step;
+    while tick <= f2_hi {
+        let x = plot_rect.left() + ((f2_hi - tick) / x_range) as f32 * plot_rect.width();
+        painter.line_segment([egui::pos2(x, plot_rect.bottom()), egui::pos2(x, plot_rect.bottom() + 5.0)], egui::Stroke::new(1.0, egui::Color32::BLACK));
+        painter.text(egui::pos2(x, plot_rect.bottom() + 8.0), egui::Align2::CENTER_TOP, format!("{:.1}", tick), tick_font.clone(), egui::Color32::BLACK);
+        tick += f2_step;
+    }
+    painter.text(egui::pos2(plot_rect.center().x, canvas.bottom() - 5.0), egui::Align2::CENTER_BOTTOM, format!("{} (ppm)", spectrum.axes[0].label), label_font.clone(), egui::Color32::BLACK);
+
+    // F1 Axis (Vertical)
+    let f1_step = preview_tick_step(y_range);
+    let mut tick = (f1_lo / f1_step).ceil() * f1_step;
+    while tick <= f1_hi {
+        let y = plot_rect.top() + ((f1_hi - tick) / y_range) as f32 * plot_rect.height();
+        painter.line_segment([egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.left() - 5.0, y)], egui::Stroke::new(1.0, egui::Color32::BLACK));
+        painter.text(egui::pos2(plot_rect.left() - 8.0, y), egui::Align2::RIGHT_CENTER, format!("{:.1}", tick), tick_font.clone(), egui::Color32::BLACK);
+        tick += f1_step;
+    }
+    // Vertical label for F1
+    painter.text(egui::pos2(canvas.left() + 5.0, plot_rect.center().y), egui::Align2::LEFT_CENTER, format!("{}", spectrum.axes[1].label), label_font.clone(), egui::Color32::BLACK);
+
+    // Title
+    let title = if settings.use_custom_title && !settings.custom_title.is_empty() {
+        settings.custom_title.clone()
+    } else {
+        format!("{} — {} (2D Heatmap)", spectrum.sample_name, spectrum.experiment_type)
+    };
+    painter.text(egui::pos2(plot_rect.left(), canvas.top() + 5.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(font_md * 1.5), egui::Color32::BLACK);
 }
 
 // ── Data preview ──────────────────────────────────────────────────
@@ -1021,14 +1268,9 @@ fn show_data_preview(
     view_state: &SpectrumViewState,
     settings: &DataExportSettings,
 ) {
-    // Show notice for 2D data
     if spectrum.is_2d() {
-        ui.label(
-            egui::RichText::new("⚠ 2D spectrum — data export shows 1D analysis results only")
-                .size(11.0)
-                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
-        );
-        ui.add_space(2.0);
+        show_data_preview_2d(ui, spectrum, settings);
+        return;
     }
 
     let sep = match settings.format {
@@ -1162,6 +1404,72 @@ fn show_data_preview(
     }
 
     // Render in a scrollable monospace area
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut preview.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(ui.available_width())
+                    .desired_rows(30)
+                    .interactive(false),
+            );
+        });
+}
+
+fn show_data_preview_2d(
+    ui: &mut egui::Ui,
+    spectrum: &SpectrumData,
+    settings: &DataExportSettings,
+) {
+    let sep = match settings.format {
+        0 => ",",
+        1 => "\t",
+        _ => "\t",
+    };
+    let dec = settings.ppm_decimals;
+
+    let mut preview = String::with_capacity(4096);
+
+    if settings.include_header {
+        preview.push_str(&format!("# 2D NMR Data Grid\n"));
+        preview.push_str(&format!("# Sample: {}\n", spectrum.sample_name));
+        preview.push_str(&format!("# Experiment: {}\n", spectrum.experiment_type));
+        preview.push('\n');
+    }
+
+    if spectrum.data_2d.is_empty() || spectrum.axes.len() < 2 {
+        preview.push_str("No 2D data available.\n");
+    } else {
+        let ppm_f2 = spectrum.axes[0].ppm_scale();
+        let ppm_f1 = spectrum.axes[1].ppm_scale();
+        
+        // F2 Header
+        preview.push_str("F1_PPM \\ F2_PPM");
+        for &p in ppm_f2.iter().take(20) {
+            preview.push_str(&format!("{}{:.prec$}", sep, p, prec = dec));
+        }
+        if ppm_f2.len() > 20 {
+            preview.push_str(&format!("{}...", sep));
+        }
+        preview.push('\n');
+
+        // Rows
+        for r in 0..spectrum.data_2d.len().min(40) {
+            preview.push_str(&format!("{:.prec$}", ppm_f1[r], prec = dec));
+            for c in 0..spectrum.data_2d[r].len().min(20) {
+                preview.push_str(&format!("{}{:.4e}", sep, spectrum.data_2d[r][c]));
+            }
+            if spectrum.data_2d[r].len() > 20 {
+                preview.push_str(&format!("{}...", sep));
+            }
+            preview.push('\n');
+        }
+        if spectrum.data_2d.len() > 40 {
+            preview.push_str(&format!("... ({} more rows)\n", spectrum.data_2d.len() - 40));
+        }
+    }
+
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {

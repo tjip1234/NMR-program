@@ -5,6 +5,9 @@ use crate::pipeline::processing::WindowFunction;
 /// State for the pipeline panel UI
 #[derive(Debug, Clone)]
 pub struct PipelinePanelState {
+    // Dimension selection for 2D
+    pub selected_dimension: usize, // 0=F2 (X), 1=F1 (Y)
+
     // Apodization
     pub apod_type: usize, // 0=None, 1=EM, 2=GM, 3=SineBell, 4=CosineBell
     pub em_lb: f64,
@@ -40,6 +43,7 @@ pub struct PipelinePanelState {
 impl Default for PipelinePanelState {
     fn default() -> Self {
         Self {
+            selected_dimension: 0, // Default to F2
             apod_type: 1, // Default to EM
             em_lb: 0.3,
             gm_gb: 0.1,
@@ -69,6 +73,8 @@ pub enum PipelineAction {
     ApplyZeroFill,
     ApplyFT,
     ApplyFT2D,
+    ReverseF2,
+    ReverseF1,
     ApplyPhaseCorrection,
     ApplyAutoPhase,
     ApplyBaselineCorrection,
@@ -138,6 +144,17 @@ pub fn show_pipeline_panel(
     );
     ui.add_space(4.0);
     ui.separator();
+
+    // ── Dimension Selector (2D Only) ──
+    if is_2d {
+        ui.horizontal(|ui| {
+            ui.label("Dimension:");
+            ui.selectable_value(&mut state.selected_dimension, 0, "F2 (X)");
+            ui.selectable_value(&mut state.selected_dimension, 1, "F1 (Y)");
+        });
+        ui.add_space(4.0);
+        ui.separator();
+    }
 
     // ── Time Domain Operations ──
     if !is_freq_domain {
@@ -216,15 +233,21 @@ pub fn show_pipeline_panel(
 
         ui.separator();
         if is_2d {
-            // 2D Fourier Transform
-            if ui.button("🔄 2D Fourier Transform").clicked() {
-                action = PipelineAction::ApplyFT2D;
-            }
+            // Note instead of 2D FT button
             ui.label(
-                egui::RichText::new("Applies complex FFT along F2 then F1,\nresult in magnitude mode.")
+                egui::RichText::new("ℹ Use 2D FT controls in the contour view")
                     .size(11.0)
                     .color(egui::Color32::from_rgb(0x88, 0x8C, 0x94)),
             );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("↔ Reverse F2").on_hover_text("Reverse the F2 (direct / X) axis").clicked() {
+                    action = PipelineAction::ReverseF2;
+                }
+                if ui.button("↕ Reverse F1").on_hover_text("Reverse the F1 (indirect / Y) axis").clicked() {
+                    action = PipelineAction::ReverseF1;
+                }
+            });
         } else {
             // 1D Fourier Transform
             ui.checkbox(&mut state.ft_use_imaginary, "Use imaginary data (complex FFT)");
@@ -324,99 +347,108 @@ pub fn show_pipeline_panel(
             }
         });
 
-        ui.collapsing("📍 Peak Detection", |ui| {
-            ui.add(
-                egui::Slider::new(&mut state.peak_threshold, 0.01..=0.50)
-                    .text("Threshold")
-                    .fixed_decimals(2),
+        if is_2d {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("ℹ Peak detection, integration, and multiplets are only available for 1D spectra.")
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(0x88, 0x8C, 0x94))
+                    .italics(),
             );
-            ui.add(
-                egui::Slider::new(&mut state.min_peak_spacing_hz, 1.0..=100.0)
-                    .text("Min spacing (Hz)")
-                    .fixed_decimals(1),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("▶ Detect Peaks").clicked() {
-                    action = PipelineAction::DetectPeaks;
-                }
-                if ui.button("✕ Clear").clicked() {
-                    action = PipelineAction::ClearPeaks;
-                }
+        } else {
+            ui.collapsing("📍 Peak Detection", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut state.peak_threshold, 0.01..=0.50)
+                        .text("Threshold")
+                        .fixed_decimals(2),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.min_peak_spacing_hz, 1.0..=100.0)
+                        .text("Min spacing (Hz)")
+                        .fixed_decimals(1),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("▶ Detect Peaks").clicked() {
+                        action = PipelineAction::DetectPeaks;
+                    }
+                    if ui.button("✕ Clear").clicked() {
+                        action = PipelineAction::ClearPeaks;
+                    }
+                });
+                ui.separator();
+                ui.label("✋ Manual peak picking:");
+                ui.horizontal(|ui| {
+                    let pk_label = if picking.peak_picking { "🎯 Picking ●" } else { "🎯 Pick Peaks" };
+                    let pk_btn = egui::Button::new(
+                        egui::RichText::new(pk_label)
+                            .color(if picking.peak_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
+                    )
+                    .fill(if picking.peak_picking { egui::Color32::from_rgb(0xD0, 0x30, 0x30) } else { ui.visuals().widgets.inactive.bg_fill });
+                    if ui.add(pk_btn).clicked() {
+                        action = PipelineAction::TogglePeakPicking;
+                    }
+                    if ui.button("⌫ Remove Last").clicked() {
+                        action = PipelineAction::RemoveLastPeak;
+                    }
+                });
+                ui.separator();
+                ui.label("🎵 Multiplet analysis:");
+                ui.horizontal(|ui| {
+                    if ui.button("▶ Detect Multiplets").clicked() {
+                        action = PipelineAction::DetectMultiplets;
+                    }
+                    if ui.button("✕ Clear").clicked() {
+                        action = PipelineAction::ClearMultiplets;
+                    }
+                });
+                ui.separator();
+                ui.label("📏 J-Coupling measurement:");
+                ui.label("Click two peaks to measure J.");
+                ui.horizontal(|ui| {
+                    let j_label = if picking.j_coupling_picking { "📏 Measuring ●" } else { "📏 Measure J" };
+                    let j_btn = egui::Button::new(
+                        egui::RichText::new(j_label)
+                            .color(if picking.j_coupling_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
+                    )
+                    .fill(if picking.j_coupling_picking { egui::Color32::from_rgb(0xCC, 0x66, 0x00) } else { ui.visuals().widgets.inactive.bg_fill });
+                    if ui.add(j_btn).clicked() {
+                        action = PipelineAction::ToggleJCouplingPicking;
+                    }
+                    if ui.button("✕ Clear").clicked() {
+                        action = PipelineAction::ClearJCouplings;
+                    }
+                });
             });
-            ui.separator();
-            ui.label("✋ Manual peak picking:");
-            ui.horizontal(|ui| {
-                let pk_label = if picking.peak_picking { "🎯 Picking ●" } else { "🎯 Pick Peaks" };
-                let pk_btn = egui::Button::new(
-                    egui::RichText::new(pk_label)
-                        .color(if picking.peak_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
-                )
-                .fill(if picking.peak_picking { egui::Color32::from_rgb(0xD0, 0x30, 0x30) } else { ui.visuals().widgets.inactive.bg_fill });
-                if ui.add(pk_btn).clicked() {
-                    action = PipelineAction::TogglePeakPicking;
-                }
-                if ui.button("⌫ Remove Last").clicked() {
-                    action = PipelineAction::RemoveLastPeak;
-                }
-            });
-            ui.separator();
-            ui.label("🎵 Multiplet analysis:");
-            ui.horizontal(|ui| {
-                if ui.button("▶ Detect Multiplets").clicked() {
-                    action = PipelineAction::DetectMultiplets;
-                }
-                if ui.button("✕ Clear").clicked() {
-                    action = PipelineAction::ClearMultiplets;
-                }
-            });
-            ui.separator();
-            ui.label("📏 J-Coupling measurement:");
-            ui.label("Click two peaks to measure J.");
-            ui.horizontal(|ui| {
-                let j_label = if picking.j_coupling_picking { "📏 Measuring ●" } else { "📏 Measure J" };
-                let j_btn = egui::Button::new(
-                    egui::RichText::new(j_label)
-                        .color(if picking.j_coupling_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
-                )
-                .fill(if picking.j_coupling_picking { egui::Color32::from_rgb(0xCC, 0x66, 0x00) } else { ui.visuals().widgets.inactive.bg_fill });
-                if ui.add(j_btn).clicked() {
-                    action = PipelineAction::ToggleJCouplingPicking;
-                }
-                if ui.button("✕ Clear").clicked() {
-                    action = PipelineAction::ClearJCouplings;
-                }
-            });
-        });
 
-        ui.collapsing("∫ Integration", |ui| {
-            ui.label("Click two points on the spectrum");
-            ui.label("to define an integration region.");
-            ui.horizontal(|ui| {
-                let int_label = if picking.integration_picking { "🎯 Picking ●" } else { "🎯 Pick Region" };
-                let int_btn = egui::Button::new(
-                    egui::RichText::new(int_label)
-                        .color(if picking.integration_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
-                )
-                .fill(if picking.integration_picking { egui::Color32::from_rgb(0x8B, 0x00, 0x8B) } else { ui.visuals().widgets.inactive.bg_fill });
-                if ui.add(int_btn).clicked() {
-                    action = PipelineAction::ToggleIntegrationPicking;
-                }
-                if ui.button("✕ Clear All").clicked() {
-                    action = PipelineAction::ClearIntegrations;
-                }
+            ui.collapsing("∫ Integration", |ui| {
+                ui.label("Click two points on the spectrum");
+                ui.label("to define an integration region.");
+                ui.horizontal(|ui| {
+                    let int_label = if picking.integration_picking { "🎯 Picking ●" } else { "🎯 Pick Region" };
+                    let int_btn = egui::Button::new(
+                        egui::RichText::new(int_label)
+                            .color(if picking.integration_picking { egui::Color32::WHITE } else { ui.visuals().text_color() })
+                    )
+                    .fill(if picking.integration_picking { egui::Color32::from_rgb(0x8B, 0x00, 0x8B) } else { ui.visuals().widgets.inactive.bg_fill });
+                    if ui.add(int_btn).clicked() {
+                        action = PipelineAction::ToggleIntegrationPicking;
+                    }
+                    if ui.button("✕ Clear All").clicked() {
+                        action = PipelineAction::ClearIntegrations;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label("Reference H count (first region):");
+                ui.add(
+                    egui::DragValue::new(integration_ref_h)
+                        .speed(0.1)
+                        .range(0.1..=100.0)
+                        .suffix(" H")
+                        .fixed_decimals(1),
+                );
             });
-            ui.add_space(4.0);
-            ui.label("Reference H count (first region):");
-            ui.add(
-                egui::DragValue::new(integration_ref_h)
-                    .speed(0.1)
-                    .range(0.1..=100.0)
-                    .suffix(" H")
-                    .fixed_decimals(1),
-            );
-        });
+        }
     }
-
     ui.separator();
 
     // Before/After toggle — only show when a snapshot exists

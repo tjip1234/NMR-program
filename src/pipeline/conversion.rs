@@ -138,6 +138,23 @@ fn convert_jeol_builtin(path: &Path, log: &mut ReproLog, settings: &ConversionSe
         "# built-in native delta2pipe — no external tools required",
     );
 
+    // Read NUS schedule from JDF file
+    if spectrum.is_2d() {
+        if let Some(nus) = jdf::read_nus_schedule(path) {
+            log.add_entry(
+                "NUS Schedule",
+                &format!(
+                    "Detected NUS data: {} sampled / {} full F1 points ({:.0}%)",
+                    nus.indices.len(), nus.full_size,
+                    nus.indices.len() as f64 / nus.full_size as f64 * 100.0
+                ),
+                "",
+            );
+            spectrum.nus_indices = Some(nus.indices);
+            spectrum.nus_full_size = Some(nus.full_size);
+        }
+    }
+
     Ok(spectrum)
 }
 
@@ -208,6 +225,23 @@ fn convert_jeol_nmrpipe(path: &Path, log: &mut ReproLog, settings: &ConversionSe
     // Fix dimensionality based on actual data
     if !spectrum.data_2d.is_empty() {
         spectrum.dimensionality = crate::data::spectrum::Dimensionality::TwoD;
+    }
+
+    // Read NUS schedule from original JDF file (delta2pipe doesn't pass this through)
+    if spectrum.is_2d() {
+        if let Some(nus) = jdf::read_nus_schedule(path) {
+            log.add_entry(
+                "NUS Schedule",
+                &format!(
+                    "Detected NUS data: {} sampled / {} full F1 points ({:.0}%)",
+                    nus.indices.len(), nus.full_size,
+                    nus.indices.len() as f64 / nus.full_size as f64 * 100.0
+                ),
+                "",
+            );
+            spectrum.nus_indices = Some(nus.indices);
+            spectrum.nus_full_size = Some(nus.full_size);
+        }
     }
 
     Ok(spectrum)

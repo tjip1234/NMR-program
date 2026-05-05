@@ -16,6 +16,22 @@ use crate::data::spectrum::*;
 use crate::log::reproducibility::ReproLog;
 use super::command::NmrPipeCommand;
 
+/// Dimension of 2D spectrum
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Dimension {
+    F2, // Direct dimension (columns)
+    F1, // Indirect dimension (rows)
+}
+
+impl std::fmt::Display for Dimension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Dimension::F2 => write!(f, "F2"),
+            Dimension::F1 => write!(f, "F1"),
+        }
+    }
+}
+
 /// Available window functions
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WindowFunction {
@@ -57,6 +73,10 @@ pub enum ProcessingOp {
     BaselineCorrection,
     ManualBaselineCorrection { num_points: usize },
     SolventSuppression { center_ppm: f64, width_ppm: f64 },
+    /// Reverse the F2 (direct / X) axis of a 2D spectrum
+    ReverseF2,
+    /// Reverse the F1 (indirect / Y) axis of a 2D spectrum
+    ReverseF1,
 }
 
 impl std::fmt::Display for ProcessingOp {
@@ -71,7 +91,7 @@ impl std::fmt::Display for ProcessingOp {
                     write!(f, "Fourier Transform (Real-only)")
                 }
             }
-            ProcessingOp::FourierTransform2D => write!(f, "2D Fourier Transform (Magnitude)"),
+            ProcessingOp::FourierTransform2D => write!(f, "2D Fourier Transform (Phase-Sensitive)"),
             ProcessingOp::PhaseCorrection { ph0, ph1 } => {
                 write!(f, "Phase Correction (PH0={:.1}°, PH1={:.1}°)", ph0, ph1)
             }
@@ -83,6 +103,8 @@ impl std::fmt::Display for ProcessingOp {
             ProcessingOp::SolventSuppression { center_ppm, width_ppm } => {
                 write!(f, "Solvent Suppression ({:.2} ± {:.2} ppm)", center_ppm, width_ppm)
             }
+            ProcessingOp::ReverseF2 => write!(f, "Reverse F2 axis"),
+            ProcessingOp::ReverseF1 => write!(f, "Reverse F1 axis"),
         }
     }
 }
@@ -91,6 +113,50 @@ impl std::fmt::Display for ProcessingOp {
 //  Apodization / Window Functions
 // =========================================================================
 
+/// Get apodization factors for a given window function
+fn get_apodization_factors(n: usize, window: &WindowFunction, sw: f64) -> Vec<f64> {
+    let mut factors = vec![1.0; n];
+    if n == 0 {
+        return factors;
+    }
+
+    let dwell = if sw > 0.0 { 1.0 / sw } else { 1.0 / n as f64 };
+
+    match window {
+        WindowFunction::Exponential { lb_hz } => {
+            let lb = *lb_hz;
+            for i in 0..n {
+                let t = i as f64 * dwell;
+                factors[i] = (-PI * lb * t).exp();
+            }
+        }
+        WindowFunction::Gaussian { gb, lb_hz } => {
+            let lb = *lb_hz;
+            let g = *gb;
+            let tmax = n as f64 * dwell;
+            for i in 0..n {
+                let t = i as f64 * dwell;
+                factors[i] = (-PI * lb * t).exp() * (-(t / (2.0 * g * tmax)).powi(2)).exp();
+            }
+        }
+        WindowFunction::SineBell { power, offset, end } => {
+            for i in 0..n {
+                let frac = i as f64 / n as f64;
+                let angle = PI * (*offset + frac * (*end - *offset));
+                factors[i] = angle.sin().powf(*power);
+            }
+        }
+        WindowFunction::CosineBell => {
+            for i in 0..n {
+                let frac = i as f64 / n as f64;
+                factors[i] = (PI * frac / 2.0).cos();
+            }
+        }
+        WindowFunction::None => {}
+    }
+    factors
+}
+
 /// Apply a window function to the FID data
 pub fn apply_apodization(
     spectrum: &mut SpectrumData,
@@ -98,7 +164,7 @@ pub fn apply_apodization(
     log: &mut ReproLog,
 ) {
     let n = spectrum.real.len();
-    if n == 0 {
+    if n == 0 || matches!(window, WindowFunction::None) {
         return;
     }
 
@@ -107,68 +173,24 @@ pub fn apply_apodization(
         .first()
         .map(|a| a.spectral_width_hz)
         .unwrap_or(1.0);
-    let dwell = if sw > 0.0 { 1.0 / sw } else { 1.0 / n as f64 };
 
-    let nmrpipe_fn: String;
+    let factors = get_apodization_factors(n, window, sw);
 
-    match window {
-        WindowFunction::Exponential { lb_hz } => {
-            let lb = *lb_hz;
-            for i in 0..n {
-                let t = i as f64 * dwell;
-                let factor = (-PI * lb * t).exp();
-                spectrum.real[i] *= factor;
-                if i < spectrum.imag.len() {
-                    spectrum.imag[i] *= factor;
-                }
-            }
-            nmrpipe_fn = format!("nmrPipe -fn EM -lb {:.3}", lb);
-        }
-        WindowFunction::Gaussian { gb, lb_hz } => {
-            let lb = *lb_hz;
-            let g = *gb;
-            let tmax = n as f64 * dwell;
-            for i in 0..n {
-                let t = i as f64 * dwell;
-                let factor =
-                    (-PI * lb * t).exp() * (-(t / (2.0 * g * tmax)).powi(2)).exp();
-                spectrum.real[i] *= factor;
-                if i < spectrum.imag.len() {
-                    spectrum.imag[i] *= factor;
-                }
-            }
-            nmrpipe_fn = format!("nmrPipe -fn GM -g1 {:.6} -g2 {:.3} -g3 {:.6}", g, lb, 0.0);
-        }
-        WindowFunction::SineBell { power, offset, end } => {
-            for i in 0..n {
-                let frac = i as f64 / n as f64;
-                let angle = PI * (*offset + frac * (*end - *offset));
-                let factor = angle.sin().powf(*power);
-                spectrum.real[i] *= factor;
-                if i < spectrum.imag.len() {
-                    spectrum.imag[i] *= factor;
-                }
-            }
-            nmrpipe_fn = format!(
-                "nmrPipe -fn SP -off {:.3} -end {:.3} -pow {:.1}",
-                offset, end, power
-            );
-        }
-        WindowFunction::CosineBell => {
-            for i in 0..n {
-                let frac = i as f64 / n as f64;
-                let factor = (PI * frac / 2.0).cos();
-                spectrum.real[i] *= factor;
-                if i < spectrum.imag.len() {
-                    spectrum.imag[i] *= factor;
-                }
-            }
-            nmrpipe_fn = "nmrPipe -fn SP -off 0.5 -end 1.0 -pow 1.0".to_string();
-        }
-        WindowFunction::None => {
-            return;
+    for i in 0..n {
+        let factor = factors[i];
+        spectrum.real[i] *= factor;
+        if i < spectrum.imag.len() {
+            spectrum.imag[i] *= factor;
         }
     }
+
+    let nmrpipe_fn = match window {
+        WindowFunction::Exponential { lb_hz } => format!("nmrPipe -fn EM -lb {:.3}", lb_hz),
+        WindowFunction::Gaussian { gb, lb_hz } => format!("nmrPipe -fn GM -g1 {:.6} -g2 {:.3} -g3 {:.6}", gb, lb_hz, 0.0),
+        WindowFunction::SineBell { power, offset, end } => format!("nmrPipe -fn SP -off {:.3} -end {:.3} -pow {:.1}", offset, end, power),
+        WindowFunction::CosineBell => "nmrPipe -fn SP -off 0.5 -end 1.0 -pow 1.0".to_string(),
+        WindowFunction::None => "".to_string(),
+    };
 
     log.add_entry(
         &format!("Apodization: {}", window),
@@ -302,6 +324,15 @@ pub fn fourier_transform(
 
     if let Some(ax) = spectrum.axes.first_mut() {
         ax.num_points = fft_size;
+        // Correct reference_ppm for the FFT bin-centre offset.
+        // After FFT-shift + reverse, index 0 maps to the frequency
+        // ORIG + (N-1)*SW/N, which is SW/N below the nominal (ORIG+SW).
+        // Subtract one bin width in ppm so index_to_ppm gives the true
+        // chemical shift for every point.
+        if ax.observe_freq_mhz > 0.0 && fft_size > 0 {
+            ax.reference_ppm -= ax.spectral_width_hz
+                / (fft_size as f64 * ax.observe_freq_mhz);
+        }
     }
 
     let nmrpipe_cmd = if use_imaginary {
@@ -329,11 +360,16 @@ pub fn fourier_transform(
 ///
 /// Pipeline:
 ///   1. FFT along F2 (direct / rows) — each row is a complex FID
-///   2. FFT along F1 (indirect / columns) — transpose, FFT each column
-///   3. Compute magnitude: sqrt(re² + im²) for display
+///      (skipped if F2 is already in frequency domain)
+///   2. FFT along F1 (indirect / columns) — FFT each column
+///      Row-pair combination depends on `spectrum.quad_mode`:
+///        - States:        F1 = A + iB
+///        - EchoAntiEcho:  F1 = P + conj(N)
+///        - StatesTPPI:    F1 = A + iB with sign alternation
+///   3. Take real part for phase-sensitive display
 ///
-/// After processing `data_2d` contains the magnitude spectrum and
-/// `data_2d_imag` is cleared.  `is_frequency_domain` is set to `true`.
+/// After processing `data_2d` contains the phase-sensitive (real) spectrum
+/// and `data_2d_imag` is cleared.  `is_frequency_domain` is set to `true`.
 pub fn fourier_transform_2d(
     spectrum: &mut SpectrumData,
     log: &mut ReproLog,
@@ -355,9 +391,26 @@ pub fn fourier_transform_2d(
     let has_imag = !spectrum.data_2d_imag.is_empty()
         && spectrum.data_2d_imag.len() == n_rows;
 
+    // Note: For mixed-domain data (F2 freq, F1 time), the caller should
+    // route to fourier_transform_f1_only() instead of this function.
+    // This function always performs F2 FFT on rows first.
+
+    let y_is_complex = spectrum.y_is_complex;
+    let actual_f1_points = if y_is_complex { n_rows / 2 } else { n_rows };
+
+    log::info!(
+        "fourier_transform_2d: n_rows={}, n_cols={}, has_imag={}, y_is_complex={}, \
+         actual_f1_points={}, is_freq_f2={}, is_freq_f1={}, quad_mode={}",
+        n_rows, n_cols, has_imag, y_is_complex, actual_f1_points,
+        spectrum.is_freq_f2, spectrum.is_freq_f1, spectrum.quad_mode,
+    );
+    let actual_f1_points = if y_is_complex { n_rows / 2 } else { n_rows };
+    let quad_mode = spectrum.quad_mode;
+
+    let mut planner = FftPlanner::new();
+
     // ── Step 1: FFT along F2 (rows) ──
     let fft_cols = next_power_of_two(n_cols);
-    let mut planner = FftPlanner::new();
     let fft_f2 = planner.plan_fft_forward(fft_cols);
 
     // Store complex result matrix (rows × fft_cols)
@@ -398,78 +451,397 @@ pub fn fourier_transform_2d(
         }
     }
 
-    // ── Step 2: FFT along F1 (columns) ──
-    let fft_rows = next_power_of_two(n_rows);
+    // ── Step 2: FFT along F1 (columns) with States deinterleaving ──
+    // If NUS schedule is present, use IST reconstruction; otherwise standard FFT.
+    let nus_indices = spectrum.nus_indices.clone();
+    let nus_full_size = spectrum.nus_full_size;
+
+    let fft_rows = if let Some(full_sz) = nus_full_size {
+        // NUS: use full grid size (already a power of two from read_nus_schedule)
+        next_power_of_two(full_sz)
+    } else {
+        next_power_of_two(actual_f1_points)
+    };
+
     let fft_f1 = planner.plan_fft_forward(fft_rows);
 
-    // Extend rows if needed (zero-pad in F1 dimension)
-    re_2d.resize(fft_rows, vec![0.0; fft_cols]);
-    im_2d.resize(fft_rows, vec![0.0; fft_cols]);
+    // Result matrices after F1 FFT
+    let mut re_out = vec![vec![0.0f64; fft_cols]; fft_rows];
+    let mut im_out = vec![vec![0.0f64; fft_cols]; fft_rows];
 
-    for col_idx in 0..fft_cols {
-        // Build column vector
-        let mut col_buf: Vec<Complex<f64>> = Vec::with_capacity(fft_rows);
-        for row_idx in 0..fft_rows {
-            col_buf.push(Complex::new(re_2d[row_idx][col_idx], im_2d[row_idx][col_idx]));
+    // Helper: extract deinterleaved F1 column from F2 FFT results.
+    // The combination depends on the quadrature mode:
+    //   States:        F1 = A + iB            (cos/sin)
+    //   EchoAntiEcho:  F1 = P + conj(N)       (echo/anti-echo)
+    //   StatesTPPI:    F1 = A + iB, negate odd k  (shifts axial artifact)
+    let extract_f1_column = |col_idx: usize, target: &mut [Complex<f64>],
+                              nus_idx: Option<&[usize]>| {
+        // Zero-fill target first
+        for v in target.iter_mut() {
+            *v = Complex::new(0.0, 0.0);
         }
 
-        // First-point correction in F1
-        if !col_buf.is_empty() {
-            col_buf[0] *= 0.5;
+        if y_is_complex && has_imag {
+            // Hypercomplex: full complex F2 data in both even and odd rows
+            for k in 0..actual_f1_points {
+                let a_re = re_2d[2 * k][col_idx];
+                let a_im = im_2d[2 * k][col_idx];
+                let b_re = if 2 * k + 1 < n_rows { re_2d[2 * k + 1][col_idx] } else { 0.0 };
+                let b_im = if 2 * k + 1 < n_rows { im_2d[2 * k + 1][col_idx] } else { 0.0 };
+
+                let val = match quad_mode {
+                    QuadMode::EchoAntiEcho => {
+                        // P + conj(N) = (a_re + b_re) + i*(a_im - b_im)
+                        Complex::new(a_re + b_re, a_im - b_im)
+                    }
+                    QuadMode::StatesTPPI => {
+                        // States with sign alternation on odd increments
+                        let sign = if k % 2 == 1 { -1.0 } else { 1.0 };
+                        Complex::new(sign * (a_re - b_im), sign * (a_im + b_re))
+                    }
+                    _ => {
+                        // States (default): A + iB = (a_re - b_im) + i*(a_im + b_re)
+                        Complex::new(a_re - b_im, a_im + b_re)
+                    }
+                };
+
+                let dest = if let Some(indices) = nus_idx {
+                    if k < indices.len() { indices[k] } else { k }
+                } else {
+                    k
+                };
+                if dest < target.len() {
+                    target[dest] = val;
+                }
+            }
+        } else if y_is_complex {
+            // States-like without imaginary F2: pair even/odd rows
+            for k in 0..actual_f1_points {
+                let re_y = re_2d[2 * k][col_idx];
+                let im_y = if 2 * k + 1 < n_rows { re_2d[2 * k + 1][col_idx] } else { 0.0 };
+
+                let val = match quad_mode {
+                    QuadMode::EchoAntiEcho => {
+                        // For EA without im F2, use im_2d from F2 FFT
+                        let a_im = im_2d[2 * k][col_idx];
+                        let b_im = if 2 * k + 1 < n_rows { im_2d[2 * k + 1][col_idx] } else { 0.0 };
+                        Complex::new(re_y + im_y, a_im - b_im)
+                    }
+                    QuadMode::StatesTPPI => {
+                        let sign = if k % 2 == 1 { -1.0 } else { 1.0 };
+                        Complex::new(sign * re_y, sign * im_y)
+                    }
+                    _ => {
+                        Complex::new(re_y, im_y)
+                    }
+                };
+
+                let dest = if let Some(indices) = nus_idx {
+                    if k < indices.len() { indices[k] } else { k }
+                } else {
+                    k
+                };
+                if dest < target.len() {
+                    target[dest] = val;
+                }
+            }
+        } else {
+            // Real indirect dimension (no quadrature)
+            for row_idx in 0..actual_f1_points {
+                let val = Complex::new(re_2d[row_idx][col_idx], im_2d[row_idx][col_idx]);
+                let dest = if let Some(indices) = nus_idx {
+                    if row_idx < indices.len() { indices[row_idx] } else { row_idx }
+                } else {
+                    row_idx
+                };
+                if dest < target.len() {
+                    target[dest] = val;
+                }
+            }
+        }
+    };
+
+    if let Some(ref indices) = nus_indices {
+        // ── NUS: Iterative Soft Thresholding (IST) reconstruction ──
+        log::info!("Using IST reconstruction for NUS data: {} sampled → {} full F1 points",
+                   indices.len(), fft_rows);
+
+        let n_ist_iter = 100;
+        let fft_f1_inv = planner.plan_fft_inverse(fft_rows);
+
+        // Build sampling mask
+        let mut mask = vec![false; fft_rows];
+        for &idx in indices.iter() {
+            if idx < fft_rows {
+                mask[idx] = true;
+            }
         }
 
-        fft_f1.process(&mut col_buf);
+        for col_idx in 0..fft_cols {
+            // Extract sampled data at NUS positions
+            let mut sampled = vec![Complex::new(0.0, 0.0); fft_rows];
+            extract_f1_column(col_idx, &mut sampled, Some(indices));
 
-        // FFT-shift (swap halves)
-        let half = fft_rows / 2;
-        for row_idx in 0..fft_rows {
-            let si = (row_idx + half) % fft_rows;
-            re_2d[row_idx][col_idx] = col_buf[si].re;
-            im_2d[row_idx][col_idx] = col_buf[si].im;
+            // IST iteration
+            let mut recon = sampled.clone();
+
+            for iter in 0..n_ist_iter {
+                // Forward FFT (time → frequency)
+                fft_f1.process(&mut recon);
+
+                // Soft threshold with decreasing threshold
+                let max_mag = recon.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
+                let threshold = max_mag * (1.0 - (iter + 1) as f64 / n_ist_iter as f64) * 0.5;
+
+                for v in recon.iter_mut() {
+                    let mag = v.norm();
+                    if mag > threshold && mag > 1e-30 {
+                        *v *= (mag - threshold) / mag;
+                    } else {
+                        *v = Complex::new(0.0, 0.0);
+                    }
+                }
+
+                // Inverse FFT (frequency → time)
+                fft_f1_inv.process(&mut recon);
+                // rustfft inverse doesn't normalize: divide by N
+                let inv_n = 1.0 / fft_rows as f64;
+                for v in recon.iter_mut() {
+                    *v *= inv_n;
+                }
+
+                // Replace sampled positions with original data
+                for (i, &is_sampled) in mask.iter().enumerate() {
+                    if is_sampled {
+                        recon[i] = sampled[i];
+                    }
+                }
+            }
+
+            // Final forward FFT for the result
+            fft_f1.process(&mut recon);
+
+            // FFT-shift (swap halves)
+            let half = fft_rows / 2;
+            for row_idx in 0..fft_rows {
+                let si = (row_idx + half) % fft_rows;
+                re_out[row_idx][col_idx] = recon[si].re;
+                im_out[row_idx][col_idx] = recon[si].im;
+            }
+        }
+    } else {
+        // ── Standard FFT along F1 ──
+        for col_idx in 0..fft_cols {
+            let mut col_buf = vec![Complex::new(0.0, 0.0); fft_rows];
+            extract_f1_column(col_idx, &mut col_buf, None);
+
+            // First-point correction in F1
+            if !col_buf.is_empty() {
+                col_buf[0] *= 0.5;
+            }
+
+            fft_f1.process(&mut col_buf);
+
+            // FFT-shift (swap halves)
+            let half = fft_rows / 2;
+            for row_idx in 0..fft_rows {
+                let si = (row_idx + half) % fft_rows;
+                re_out[row_idx][col_idx] = col_buf[si].re;
+                im_out[row_idx][col_idx] = col_buf[si].im;
+            }
         }
     }
 
-    // ── Step 3: Compute magnitude and reverse axes ──
-    // Reverse each row so index 0 → highest ppm (matches 1D convention)
-    let mut magnitude = vec![vec![0.0f64; fft_cols]; fft_rows];
+    // ── Step 3: Extract spectral data and reverse axes ──
+    let mut result_re = vec![vec![0.0f64; fft_cols]; fft_rows];
+    let mut result_im = vec![vec![0.0f64; fft_cols]; fft_rows];
     for row_idx in 0..fft_rows {
         for col_idx in 0..fft_cols {
-            let re = re_2d[row_idx][col_idx];
-            let im = im_2d[row_idx][col_idx];
+            let re = re_out[row_idx][col_idx];
+            let im = im_out[row_idx][col_idx];
+
             // Reverse column direction (so high ppm = left = index 0)
-            magnitude[row_idx][fft_cols - 1 - col_idx] = (re * re + im * im).sqrt();
+            let out_col = fft_cols - 1 - col_idx;
+
+            if quad_mode == QuadMode::Magnitude {
+                result_re[row_idx][out_col] = (re * re + im * im).sqrt();
+                result_im[row_idx][out_col] = 0.0;
+            } else {
+                result_re[row_idx][out_col] = re;
+                result_im[row_idx][out_col] = im;
+            }
         }
     }
 
     // Reverse row order for F1 (so high ppm = top = index 0)
-    magnitude.reverse();
+    result_re.reverse();
+    result_im.reverse();
 
     // Store result
-    spectrum.data_2d = magnitude;
-    spectrum.data_2d_imag.clear();
+    spectrum.data_2d = result_re;
+    spectrum.data_2d_imag = result_im;
     spectrum.is_frequency_domain = true;
+    spectrum.is_freq_f1 = true;
+    spectrum.is_freq_f2 = true;
+    spectrum.y_is_complex = false; // no longer interleaved after FT
 
     // Also set the 1D projection (first row) for the status bar
     spectrum.real = spectrum.data_2d.first().cloned().unwrap_or_default();
-    spectrum.imag.clear();
+    spectrum.imag = spectrum.data_2d_imag.first().cloned().unwrap_or_default();
 
-    // Update axis sizes
+    // Update axis sizes and correct reference_ppm for FFT bin-centre offset
     if let Some(ax) = spectrum.axes.get_mut(0) {
         ax.num_points = fft_cols;
+        if ax.observe_freq_mhz > 0.0 && fft_cols > 0 {
+            ax.reference_ppm -= ax.spectral_width_hz
+                / (fft_cols as f64 * ax.observe_freq_mhz);
+        }
     }
     if let Some(ax) = spectrum.axes.get_mut(1) {
         ax.num_points = fft_rows;
+        if ax.observe_freq_mhz > 0.0 && fft_rows > 0 {
+            ax.reference_ppm -= ax.spectral_width_hz
+                / (fft_rows as f64 * ax.observe_freq_mhz);
+        }
     }
 
     log.add_entry(
         "2D Fourier Transform",
         &format!(
-            "Complex 2D FFT: {}×{} → {}×{} (magnitude mode)",
-            n_rows, n_cols, fft_rows, fft_cols
+            "Complex 2D FFT: {}×{} → {}×{} (phase-sensitive, {}{}{})",
+            n_rows, n_cols, fft_rows, fft_cols,
+            spectrum.quad_mode,
+            if y_is_complex { ", deinterleave" } else { "" },
+            if nus_indices.is_some() { ", IST NUS reconstruction" } else { "" }
         ),
         &format!(
             "nmrPipe -fn FT -auto  # F2\nnmrPipe -fn FT -auto  # F1"
         ),
+    );
+}
+
+/// Apply F1-only FFT to a 2D spectrum where F2 is already in frequency domain.
+///
+/// This handles the case where JEOL data has processed F2 but time-domain F1
+/// (common for HSQC, HMBC). If Y dimension is complex, consecutive row pairs
+/// are combined according to `spectrum.quad_mode`.
+pub fn fourier_transform_f1_only(
+    spectrum: &mut SpectrumData,
+    log: &mut ReproLog,
+) {
+    let n_rows = spectrum.data_2d.len();
+    if n_rows == 0 {
+        return;
+    }
+    let n_cols = spectrum.data_2d[0].len();
+    if n_cols == 0 {
+        return;
+    }
+
+    let y_is_complex = spectrum.y_is_complex;
+    let quad_mode = spectrum.quad_mode;
+    let actual_f1_points = if y_is_complex { n_rows / 2 } else { n_rows };
+    let fft_rows = next_power_of_two(actual_f1_points);
+
+    let mut planner = FftPlanner::new();
+    let fft_f1 = planner.plan_fft_forward(fft_rows);
+
+    let mut result_re = vec![vec![0.0f64; n_cols]; fft_rows];
+    let mut result_im = vec![vec![0.0f64; n_cols]; fft_rows];
+
+    for col_idx in 0..n_cols {
+        let mut col_buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); fft_rows];
+
+        if y_is_complex {
+            for k in 0..actual_f1_points.min(fft_rows) {
+                let re_y = spectrum.data_2d[2 * k][col_idx];
+                let im_y = if 2 * k + 1 < n_rows {
+                    spectrum.data_2d[2 * k + 1][col_idx]
+                } else {
+                    0.0
+                };
+
+                col_buf[k] = match quad_mode {
+                    QuadMode::EchoAntiEcho => {
+                        // P + conj(N) — F2 is already freq domain so values are
+                        // real at each point; treat even as P_re, odd as N_re.
+                        Complex::new(re_y + im_y, 0.0)
+                    }
+                    QuadMode::StatesTPPI => {
+                        let sign = if k % 2 == 1 { -1.0 } else { 1.0 };
+                        Complex::new(sign * re_y, sign * im_y)
+                    }
+                    _ => {
+                        // States
+                        Complex::new(re_y, im_y)
+                    }
+                };
+            }
+        } else {
+            for row_idx in 0..actual_f1_points.min(fft_rows) {
+                col_buf[row_idx] = Complex::new(spectrum.data_2d[row_idx][col_idx], 0.0);
+            }
+        }
+
+        if !col_buf.is_empty() {
+            col_buf[0] *= 0.5;
+        }
+        fft_f1.process(&mut col_buf);
+
+        // FFT-shift and extract spectral data
+        let half = fft_rows / 2;
+        for row_idx in 0..fft_rows {
+            let si = (row_idx + half) % fft_rows;
+            let re = col_buf[si].re;
+            let im = col_buf[si].im;
+
+            if quad_mode == QuadMode::Magnitude {
+                result_re[row_idx][col_idx] = (re * re + im * im).sqrt();
+                result_im[row_idx][col_idx] = 0.0;
+            } else {
+                result_re[row_idx][col_idx] = re;
+                result_im[row_idx][col_idx] = im;
+            };
+        }
+    }
+
+    // Reverse row order for F1 (high ppm = top = index 0)
+    result_re.reverse();
+    result_im.reverse();
+
+    // Reverse columns for F2 (high ppm = left = index 0) — needed since F2
+    // frequency data from the converter may not be reversed yet
+    // Actually, F2 is already in frequency domain with its own ordering,
+    // so we don't reverse columns here.
+
+    spectrum.data_2d = result_re;
+    spectrum.data_2d_imag = result_im;
+    spectrum.is_frequency_domain = true;
+    spectrum.is_freq_f1 = true;
+    spectrum.is_freq_f2 = true; // should already be true but set anyway
+    spectrum.y_is_complex = false;
+
+    spectrum.real = spectrum.data_2d.first().cloned().unwrap_or_default();
+    spectrum.imag = spectrum.data_2d_imag.first().cloned().unwrap_or_default();
+
+    if let Some(ax) = spectrum.axes.get_mut(1) {
+        ax.num_points = fft_rows;
+        // Correct reference_ppm for FFT bin-centre offset (same as full 2D FT)
+        if ax.observe_freq_mhz > 0.0 && fft_rows > 0 {
+            ax.reference_ppm -= ax.spectral_width_hz
+                / (fft_rows as f64 * ax.observe_freq_mhz);
+        }
+    }
+
+    log.add_entry(
+        "F1-only Fourier Transform",
+        &format!(
+            "F1 FFT: {}×{} → {}×{} (phase-sensitive, {}{})",
+            n_rows, n_cols, fft_rows, n_cols,
+            spectrum.quad_mode,
+            if y_is_complex { ", deinterleave" } else { "" }
+        ),
+        "nmrPipe -fn FT -auto  # F1 only",
     );
 }
 
@@ -1060,5 +1432,240 @@ pub fn execute_via_nmrpipe(
             format!("NMRPipe execution failed: {}", result.stderr),
         ));
     }
+    Ok(())
+}
+
+// =========================================================================
+//  Axis Reversal (2D)
+// =========================================================================
+
+/// Reverse the F2 (direct / column) axis of a 2D spectrum.
+///
+/// This reverses every row in `data_2d` (and `data_2d_imag`) and adjusts
+/// the F2 axis parameters so that `index_to_ppm` still returns correct values.
+pub fn reverse_f2(spectrum: &mut SpectrumData, log: &mut ReproLog) {
+    for row in &mut spectrum.data_2d {
+        row.reverse();
+    }
+    for row in &mut spectrum.data_2d_imag {
+        row.reverse();
+    }
+    // Also reverse 1D real/imag if they shadow F2
+    if !spectrum.real.is_empty() {
+        spectrum.real.reverse();
+    }
+    if !spectrum.imag.is_empty() {
+        spectrum.imag.reverse();
+    }
+    // Adjust axis: after reversal index 0 maps to the old last-point ppm.
+    if let Some(ax) = spectrum.axes.get_mut(0) {
+        let old_ref = ax.reference_ppm;
+        let sw_ppm = if ax.observe_freq_mhz > 0.0 {
+            ax.spectral_width_hz / ax.observe_freq_mhz
+        } else {
+            0.0
+        };
+        // Old last point ppm = old_ref - sw_ppm.  After reversal that becomes index 0.
+        ax.reference_ppm = old_ref - sw_ppm;
+        // The sweep now goes in the opposite direction, which is equivalent to
+        // keeping sw positive and flipping reference_ppm to the other end.
+        // Since index_to_ppm(i) = ref - i/N * sw, we need ref = old_last and
+        // the sweep effectively runs upward.  We can model this by negating sw_hz
+        // so the formula runs the other way, but that would break other code.
+        // Instead, set reference to the new first-point value and negate sw.
+        ax.spectral_width_hz = -ax.spectral_width_hz;
+    }
+    log.add_entry("Reverse F2", "Reversed the F2 (direct) axis", "# NMRPipe: no direct equivalent — process before FT or use TP/ZTP");
+    log::info!("reverse_f2: reversed columns of 2D data");
+}
+
+/// Reverse the F1 (indirect / row) axis of a 2D spectrum.
+///
+/// This reverses the row order in `data_2d` (and `data_2d_imag`) and
+/// adjusts the F1 axis parameters.
+pub fn reverse_f1(spectrum: &mut SpectrumData, log: &mut ReproLog) {
+    spectrum.data_2d.reverse();
+    spectrum.data_2d_imag.reverse();
+    // Adjust axis
+    if spectrum.axes.len() >= 2 {
+        let ax = &mut spectrum.axes[1];
+        let sw_ppm = if ax.observe_freq_mhz > 0.0 {
+            ax.spectral_width_hz / ax.observe_freq_mhz
+        } else {
+            0.0
+        };
+        ax.reference_ppm = ax.reference_ppm - sw_ppm;
+        ax.spectral_width_hz = -ax.spectral_width_hz;
+    }
+    log.add_entry("Reverse F1", "Reversed the F1 (indirect) axis", "# NMRPipe: no direct equivalent — process before FT or use TP/ZTP");
+    log::info!("reverse_f1: reversed rows of 2D data");
+}
+
+// =========================================================================
+//  2D Processing Operations
+// =========================================================================
+
+/// Apply a window function to a 2D spectrum along the specified dimension
+pub fn apply_apodization_2d(
+    spectrum: &mut SpectrumData,
+    window: &WindowFunction,
+    dimension: Dimension,
+    log: &mut ReproLog,
+) -> io::Result<()> {
+    if spectrum.data_2d.is_empty() {
+        return Ok(());
+    }
+    let n_rows = spectrum.data_2d.len();
+    let n_cols = spectrum.data_2d[0].len();
+
+    match dimension {
+        Dimension::F2 => {
+            let sw = spectrum.axes.get(0).map(|ax| ax.spectral_width_hz).unwrap_or(1.0);
+            let factors = get_apodization_factors(n_cols, window, sw);
+            for row_idx in 0..n_rows {
+                for col_idx in 0..n_cols {
+                    let f = factors[col_idx];
+                    spectrum.data_2d[row_idx][col_idx] *= f;
+                    if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx] *= f;
+                    }
+                }
+            }
+        }
+        Dimension::F1 => {
+            let sw = spectrum.axes.get(1).map(|ax| ax.spectral_width_hz).unwrap_or(1.0);
+            let factors = get_apodization_factors(n_rows, window, sw);
+            for row_idx in 0..n_rows {
+                let f = factors[row_idx];
+                for col_idx in 0..n_cols {
+                    spectrum.data_2d[row_idx][col_idx] *= f;
+                    if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx] *= f;
+                    }
+                }
+            }
+        }
+    }
+
+    log.add_entry(
+        &format!("2D Apodization ({})", dimension),
+        &format!("Applied {} along {}", window, dimension),
+        &format!("nmrPipe -fn ... # 2D {}", dimension),
+    );
+    Ok(())
+}
+
+/// Zero-fill a 2D spectrum along the specified dimension
+pub fn zero_fill_2d(
+    spectrum: &mut SpectrumData,
+    dimension: Dimension,
+    log: &mut ReproLog,
+) -> io::Result<()> {
+    if spectrum.data_2d.is_empty() {
+        return Ok(());
+    }
+    let n_rows = spectrum.data_2d.len();
+    let n_cols = spectrum.data_2d[0].len();
+
+    match dimension {
+        Dimension::F2 => {
+            let target_size = next_power_of_two(n_cols);
+            if target_size > n_cols {
+                for row in spectrum.data_2d.iter_mut() {
+                    row.resize(target_size, 0.0);
+                }
+                for row in spectrum.data_2d_imag.iter_mut() {
+                    row.resize(target_size, 0.0);
+                }
+                if let Some(ax) = spectrum.axes.get_mut(0) {
+                    ax.num_points = target_size;
+                }
+            }
+        }
+        Dimension::F1 => {
+            let target_size = next_power_of_two(n_rows);
+            if target_size > n_rows {
+                spectrum.data_2d.resize(target_size, vec![0.0; n_cols]);
+                if !spectrum.data_2d_imag.is_empty() {
+                    spectrum.data_2d_imag.resize(target_size, vec![0.0; n_cols]);
+                }
+                if let Some(ax) = spectrum.axes.get_mut(1) {
+                    ax.num_points = target_size;
+                }
+            }
+        }
+    }
+
+    log.add_entry(
+        &format!("2D Zero Fill ({})", dimension),
+        &format!("Zero-filled {} dimension to power of two", dimension),
+        &format!("nmrPipe -fn ZF ... # 2D {}", dimension),
+    );
+    Ok(())
+}
+
+/// Apply phase correction to a 2D spectrum along the specified dimension
+pub fn phase_correct_2d(
+    spectrum: &mut SpectrumData,
+    ph0_degrees: f64,
+    ph1_degrees: f64,
+    dimension: Dimension,
+    log: &mut ReproLog,
+) -> io::Result<()> {
+    if spectrum.data_2d.is_empty() {
+        return Ok(());
+    }
+    let n_rows = spectrum.data_2d.len();
+    let n_cols = spectrum.data_2d[0].len();
+
+    let ph0 = ph0_degrees * PI / 180.0;
+    let ph1 = ph1_degrees * PI / 180.0;
+
+    match dimension {
+        Dimension::F2 => {
+            for row_idx in 0..n_rows {
+                for col_idx in 0..n_cols {
+                    let frac = col_idx as f64 / n_cols as f64;
+                    let phase = ph0 + ph1 * frac;
+                    let (sin_p, cos_p) = phase.sin_cos();
+                    let re = spectrum.data_2d[row_idx][col_idx];
+                    let im = if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx]
+                    } else {
+                        0.0
+                    };
+                    spectrum.data_2d[row_idx][col_idx] = re * cos_p - im * sin_p;
+                    if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx] = re * sin_p + im * cos_p;
+                    }
+                }
+            }
+        }
+        Dimension::F1 => {
+            for row_idx in 0..n_rows {
+                let frac = row_idx as f64 / n_rows as f64;
+                let phase = ph0 + ph1 * frac;
+                let (sin_p, cos_p) = phase.sin_cos();
+                for col_idx in 0..n_cols {
+                    let re = spectrum.data_2d[row_idx][col_idx];
+                    let im = if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx]
+                    } else {
+                        0.0
+                    };
+                    spectrum.data_2d[row_idx][col_idx] = re * cos_p - im * sin_p;
+                    if row_idx < spectrum.data_2d_imag.len() && col_idx < spectrum.data_2d_imag[row_idx].len() {
+                        spectrum.data_2d_imag[row_idx][col_idx] = re * sin_p + im * cos_p;
+                    }
+                }
+            }
+        }
+    }
+
+    log.add_entry(
+        &format!("2D Phase Correction ({})", dimension),
+        &format!("PH0={:.1}, PH1={:.1} along {}", ph0_degrees, ph1_degrees, dimension),
+        &format!("nmrPipe -fn PS -p0 {:.1} -p1 {:.1} -di", ph0_degrees, ph1_degrees),
+    );
     Ok(())
 }

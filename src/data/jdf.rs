@@ -5,6 +5,7 @@
 /// delta2pipe handles all the proprietary JDF binary details.
 
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
@@ -250,4 +251,84 @@ pub fn convert_jdf(
         command_string: cmd_string,
         log_output,
     })
+}
+
+/// NUS (Non-Uniform Sampling) schedule extracted from a JDF file.
+#[derive(Debug, Clone)]
+pub struct NusSchedule {
+    /// Indices of sampled F1 increments (0-based)
+    pub indices: Vec<usize>,
+    /// Full F1 grid size (e.g., 128 if 25% of 128 were sampled)
+    pub full_size: usize,
+}
+
+/// Read the NUS schedule from a JEOL JDF file, if present.
+///
+/// The JDF header stores `list_start[dim]` / `list_length[dim]` arrays at
+/// byte offsets 1220 and 1252 (8 entries × 4 bytes each).  For NUS data the
+/// indirect dimension (dim=1) has a non-zero list that contains the sampled
+/// t1 delay values as big-endian `f64`.  We convert these to integer indices
+/// by dividing by the smallest non-zero increment (the dwell time).
+pub fn read_nus_schedule(jdf_path: &Path) -> Option<NusSchedule> {
+    let mut f = std::fs::File::open(jdf_path).ok()?;
+    let mut header = [0u8; 1360];
+    f.read_exact(&mut header).ok()?;
+
+    // JDF is big-endian
+    let list_start_dim1 = u32::from_be_bytes([
+        header[1224], header[1225], header[1226], header[1227],
+    ]) as u64;
+    let list_length_dim1 = u32::from_be_bytes([
+        header[1256], header[1257], header[1258], header[1259],
+    ]) as usize;
+
+    if list_length_dim1 == 0 || list_start_dim1 == 0 {
+        return None;
+    }
+
+    // Read the list as big-endian f64 values (time delays)
+    let n_entries = list_length_dim1 / 8;
+    if n_entries < 2 {
+        return None;
+    }
+
+    use std::io::Seek;
+    f.seek(std::io::SeekFrom::Start(list_start_dim1)).ok()?;
+    let mut buf = vec![0u8; list_length_dim1];
+    f.read_exact(&mut buf).ok()?;
+
+    let mut times: Vec<f64> = Vec::with_capacity(n_entries);
+    for i in 0..n_entries {
+        let bytes: [u8; 8] = buf[i * 8..(i + 1) * 8].try_into().ok()?;
+        times.push(f64::from_be_bytes(bytes));
+    }
+
+    // Find dwell time = smallest non-zero increment
+    let dwell = times.iter()
+        .filter(|&&t| t > 1e-15)
+        .copied()
+        .fold(f64::MAX, f64::min);
+
+    if dwell <= 0.0 || dwell == f64::MAX {
+        return None;
+    }
+
+    // Convert times to integer indices
+    let indices: Vec<usize> = times.iter()
+        .map(|&t| (t / dwell + 0.5) as usize)
+        .collect();
+
+    let max_idx = indices.iter().copied().max().unwrap_or(0);
+
+    // Full size: next power of two above max_idx + 1
+    let full_size = (max_idx + 1).next_power_of_two();
+
+    log::info!(
+        "NUS schedule from JDF: {} sampled out of {} full F1 points ({:.1}% sampling)",
+        indices.len(), full_size,
+        indices.len() as f64 / full_size as f64 * 100.0
+    );
+    log::debug!("NUS indices: {:?}", indices);
+
+    Some(NusSchedule { indices, full_size })
 }

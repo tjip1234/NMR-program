@@ -137,10 +137,10 @@ pub fn show_toolbar(
 pub fn open_file_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("Open NMR Data File")
+        .add_filter("All Files", &["*"])
         .add_filter("JEOL Delta", &["jdf"])
         .add_filter("JCAMP-DX", &["jdx", "dx", "jcamp"])
         .add_filter("NMRPipe", &["fid", "ft1", "ft2"])
-        .add_filter("All Files", &["*"])
         .pick_file()
 }
 

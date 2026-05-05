@@ -373,20 +373,6 @@ pub fn show_spectrum_1d(
 
         // ── Integration regions ──
         if show_integrations_flag && !integrations_clone.is_empty() {
-            let fill_colors = [
-                egui::Color32::from_rgba_premultiplied(76, 175, 80, 40),
-                egui::Color32::from_rgba_premultiplied(33, 150, 243, 40),
-                egui::Color32::from_rgba_premultiplied(255, 152, 0, 40),
-                egui::Color32::from_rgba_premultiplied(156, 39, 176, 40),
-                egui::Color32::from_rgba_premultiplied(244, 67, 54, 40),
-            ];
-            let border_colors = [
-                egui::Color32::from_rgb(76, 175, 80),
-                egui::Color32::from_rgb(33, 150, 243),
-                egui::Color32::from_rgb(255, 152, 0),
-                egui::Color32::from_rgb(156, 39, 176),
-                egui::Color32::from_rgb(244, 67, 54),
-            ];
             let first_raw = integrations_clone
                 .first()
                 .map(|r| r.2)
@@ -395,7 +381,18 @@ pub fn show_spectrum_1d(
                 .max(1e-12);
 
             for (idx, &(start_ppm, end_ppm, raw_val)) in integrations_clone.iter().enumerate() {
-                let c = idx % fill_colors.len();
+                let base_color = colors.integration_colors[idx % colors.integration_colors.len()];
+                
+                // Professional styling based on theme
+                let (fill_alpha, border_alpha) = if colors.is_dark {
+                    (0x40, 0xA0) // Cyberpunk: slightly bolder
+                } else {
+                    (0x22, 0x90) // Scientific: more transparent fill, sharp border
+                };
+
+                let fill_color = base_color.gamma_multiply(fill_alpha as f32 / 255.0);
+                let border_color = base_color.gamma_multiply(border_alpha as f32 / 255.0);
+                
                 let lo = start_ppm.min(end_ppm);
                 let hi = start_ppm.max(end_ppm);
 
@@ -415,25 +412,26 @@ pub fn show_spectrum_1d(
 
                 if !region_pts.is_empty() {
                     let fill_line = Line::new(PlotPoints::from(region_pts))
-                        .color(fill_colors[c])
+                        .color(fill_color)
                         .fill(0.0)
                         .width(0.0)
                         .name(format!("Int {}", idx + 1));
                     plot_ui.line(fill_line);
                 }
 
-                // Boundary dashed lines
+                // Boundary lines — thin and professional
                 let disp_lo = if is_freq { -hi } else { lo };
                 let disp_hi = if is_freq { -lo } else { hi };
+                
                 plot_ui.vline(
                     VLine::new(disp_lo)
-                        .color(border_colors[c])
-                        .style(egui_plot::LineStyle::dashed_dense()),
+                        .color(border_color)
+                        .width(1.0),
                 );
                 plot_ui.vline(
                     VLine::new(disp_hi)
-                        .color(border_colors[c])
-                        .style(egui_plot::LineStyle::dashed_dense()),
+                        .color(border_color)
+                        .width(1.0),
                 );
 
                 // Integral value label centered in region
@@ -448,13 +446,15 @@ pub fn show_spectrum_1d(
                     })
                     .map(|(&y, _)| y * vert_scale)
                     .fold(0.0f64, f64::max);
-                let label_y = max_y_in_region * 1.08;
+                
+                let label_y = max_y_in_region + (plot_ui.plot_bounds().height() * 0.05);
                 let rel_val = (raw_val / first_raw) * ref_h;
                 let label = Text::new(
                     [disp_mid, label_y].into(),
                     egui::RichText::new(format!("{:.2}H", rel_val))
                         .size(11.0)
-                        .color(border_colors[c]),
+                        .strong()
+                        .color(border_color),
                 )
                 .anchor(egui::Align2::CENTER_BOTTOM);
                 plot_ui.text(label);
@@ -482,17 +482,56 @@ pub fn show_spectrum_1d(
                 .shape(egui_plot::MarkerShape::Down);
             plot_ui.points(markers);
 
-            // Peak ppm labels above each marker
-            for peak in &peaks_clone {
-                let x = if is_freq { -peak[0] } else { peak[0] };
-                let y = if clip_neg {
-                    (peak[1] * vert_scale).max(0.0)
+            // Peak ppm labels at the top of the plot with connecting lines
+            let bounds = plot_ui.plot_bounds();
+            let y_max = bounds.max()[1];
+            let y_min = bounds.min()[1];
+            let y_range = y_max - y_min;
+
+            // Fixed top positions in the current view for labels
+            let label_y_top = y_max - y_range * 0.05;
+            let label_y_stagger = y_max - y_range * 0.12;
+
+            let mut last_label_x = f64::NEG_INFINITY;
+            let mut use_stagger = false;
+
+            // Collect and sort peaks by x position to ensure overlap avoidance works correctly
+            let mut label_data: Vec<(f64, f64, f64)> = peaks_clone
+                .iter()
+                .map(|p| {
+                    let x = if is_freq { -p[0] } else { p[0] };
+                    let y = if clip_neg {
+                        (p[1] * vert_scale).max(0.0)
+                    } else {
+                        p[1] * vert_scale
+                    };
+                    (x, y, p[0])
+                })
+                .collect();
+            label_data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            for (x, y_peak, orig_ppm) in label_data {
+                // Avoid overlap by staggering height if peaks are close in X
+                let x_threshold = bounds.width() * 0.04; // 4% of visible width
+                if (x - last_label_x).abs() < x_threshold {
+                    use_stagger = !use_stagger;
                 } else {
-                    peak[1] * vert_scale
-                };
+                    use_stagger = false;
+                }
+                last_label_x = x;
+
+                let ly = if use_stagger { label_y_stagger } else { label_y_top };
+
+                // Draw a thin connecting line from peak tip to the label position
+                plot_ui.line(
+                    Line::new(vec![[x, y_peak], [x, ly]])
+                        .color(colors.peak_label.linear_multiply(0.4))
+                        .width(0.5),
+                );
+
                 let label = Text::new(
-                    [x, y * 1.06].into(),
-                    egui::RichText::new(format!("{:.2}", peak[0]))
+                    [x, ly].into(),
+                    egui::RichText::new(format!("{:.2}", orig_ppm))
                         .size(9.0)
                         .color(colors.peak_label),
                 )

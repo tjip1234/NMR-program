@@ -77,10 +77,11 @@ fn axis_from_fdata(fdata: &Fdata, dim: i32) -> AxisParams {
 /// The `planes` vector is produced by `delta_to_pipe()` / `bruker_to_pipe()`.
 ///
 /// Data layout in a plane:
-/// - 1D complex: interleaved R,I,R,I,... with FDSIZE = number of complex pairs
+/// - 1D pipe mode: interleaved R,I,R,I,...
+/// - 1D file mode: sequential R...R then I...I
 /// - 1D real: sequential R,R,R,...
 /// - 2D: one plane = y_size rows × x_row_width, sequential row-major;
-///   each row may be complex-interleaved if FDQUADFLAG=0
+///   each row is [R(x_size), I(x_size)] for complex X (sequential, NOT interleaved)
 fn fdata_planes_to_spectrum(
     source_path: &Path,
     fdata: &Fdata,
@@ -97,7 +98,9 @@ fn fdata_planes_to_spectrum(
     };
 
     let is_complex = fdata.is_complex(CUR_XDIM);
+    let is_complex_y = if dim_count >= 2 { fdata.is_complex(CUR_YDIM) } else { false };
     let is_freq = fdata.is_freq(CUR_XDIM);
+    let is_freq_y = if dim_count >= 2 { fdata.is_freq(CUR_YDIM) } else { true };
 
     // Flatten all planes into one big f32 buffer
     let all_data: Vec<f32> = planes.iter().flat_map(|p| p.iter().copied()).collect();
@@ -123,6 +126,29 @@ fn fdata_planes_to_spectrum(
         axes.push(axis_y);
     }
 
+    // Derive F1 quadrature mode from FD2DPHASE in the FDATA header.
+    // NMRPipe convention: 0=Magnitude, 1=TPPI, 2=States, 3=States-TPPI/Image
+    let quad_mode = if is_2d && is_complex_y {
+        match fdata.data[FD2DPHASE] as i32 {
+            1 => QuadMode::TPPI,
+            2 => QuadMode::States,
+            3 => {
+                // FD2DPHASE = 3 from JEOL delta2pipe when both dims complex.
+                // Gradient-selected heteronuclear experiments (HSQC, HMBC)
+                // use Echo-Antiecho encoding; homonuclear (COSY) use States.
+                match experiment_type {
+                    ExperimentType::Hsqc | ExperimentType::Hmbc => QuadMode::EchoAntiEcho,
+                    _ => QuadMode::States,
+                }
+            }
+            _ => QuadMode::Magnitude,
+        }
+    } else if is_2d {
+        QuadMode::Magnitude
+    } else {
+        QuadMode::States // irrelevant for 1D
+    };
+
     let mut spectrum = SpectrumData {
         source_path: source_path.to_path_buf(),
         vendor_format: VendorFormat::Unknown, // caller will set
@@ -134,7 +160,13 @@ fn fdata_planes_to_spectrum(
         imag: Vec::new(),
         data_2d: Vec::new(),
         data_2d_imag: Vec::new(),
-        is_frequency_domain: is_freq,
+        is_frequency_domain: is_freq && is_freq_y,
+        is_freq_f2: is_freq,
+        is_freq_f1: is_freq_y,
+        y_is_complex: is_complex_y,
+        quad_mode,
+        nus_indices: None,
+        nus_full_size: None,
         nmrpipe_path: None,
         conversion_method_used: String::new(),
     };
@@ -156,8 +188,9 @@ fn fdata_planes_to_spectrum(
             let row_data = &all_data[start..end];
 
             if is_complex && row_data.len() >= x_size * 2 {
-                let real_row: Vec<f64> = row_data.iter().step_by(2).map(|&v| v as f64).collect();
-                let imag_row: Vec<f64> = row_data.iter().skip(1).step_by(2).map(|&v| v as f64).collect();
+                // NMRPipe file-mode layout: sequential [R(x_size), I(x_size)]
+                let real_row: Vec<f64> = row_data[..x_size].iter().map(|&v| v as f64).collect();
+                let imag_row: Vec<f64> = row_data[x_size..2 * x_size].iter().map(|&v| v as f64).collect();
                 spectrum.data_2d.push(real_row);
                 spectrum.data_2d_imag.push(imag_row);
             } else {
@@ -175,6 +208,18 @@ fn fdata_planes_to_spectrum(
             }
             // Store first row as 1D fallback
             spectrum.real = first_row.clone();
+        }
+        // Update y-axis num_points from actual row count
+        if let Some(ax) = spectrum.axes.get_mut(1) {
+            let fdata_y_size = y_size;
+            let actual_rows = spectrum.data_2d.len();
+            if fdata_y_size != actual_rows {
+                eprintln!(
+                    "[native_converter] F1 num_points override: FDATA says {} but actual rows = {}",
+                    fdata_y_size, actual_rows
+                );
+            }
+            ax.num_points = actual_rows;
         }
     } else {
         // 1D data
@@ -244,6 +289,20 @@ pub fn convert_jdf_native(path: &Path, opts: &NativeJeolOptions) -> io::Result<S
     let result = delta2pipe::delta_to_pipe(&mut reader, &delta_opts)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
+    // Debug: dump raw FDATA parameters for 2D
+    if result.fdata.dim_count() >= 2 {
+        eprintln!(
+            "[delta2pipe FDATA] path={}\n  X: size={} sw={:.1} obs={:.4} orig={:.1} complex={} freq={}\n  Y: size={} sw={:.1} obs={:.4} orig={:.1} complex={} freq={}\n  FD2DPHASE={} planes={} total_floats={}",
+            path.display(),
+            result.fdata.get_size(CUR_XDIM), result.fdata.get_sw(CUR_XDIM), result.fdata.get_obs(CUR_XDIM), result.fdata.get_orig(CUR_XDIM),
+            result.fdata.is_complex(CUR_XDIM), result.fdata.is_freq(CUR_XDIM),
+            result.fdata.get_size(CUR_YDIM), result.fdata.get_sw(CUR_YDIM), result.fdata.get_obs(CUR_YDIM), result.fdata.get_orig(CUR_YDIM),
+            result.fdata.is_complex(CUR_YDIM), result.fdata.is_freq(CUR_YDIM),
+            result.fdata.data[FD2DPHASE], result.planes.len(),
+            result.planes.iter().map(|p| p.len()).sum::<usize>(),
+        );
+    }
+
     let mut spectrum = fdata_planes_to_spectrum(path, &result.fdata, &result.planes);
     spectrum.vendor_format = VendorFormat::Jeol;
     spectrum.conversion_method_used = "Built-in (native delta2pipe)".to_string();
@@ -261,6 +320,33 @@ pub fn convert_jdf_native(path: &Path, opts: &NativeJeolOptions) -> io::Result<S
         result.stored_df_val,
         result.applied_df_val,
     );
+    if spectrum.is_2d() {
+        log::info!(
+            "  2D details: data_2d={}rows × {}cols, is_freq_f2={}, is_freq_f1={}, y_is_complex={}, \
+             FTFLAG_X={}, FTFLAG_Y={}, QUADFLAG_X={}, QUADFLAG_Y={}, \
+             NDSIZE_X={}, NDSIZE_Y={}, planes={}, all_data_len={}",
+            spectrum.data_2d.len(),
+            spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0),
+            spectrum.is_freq_f2,
+            spectrum.is_freq_f1,
+            spectrum.y_is_complex,
+            result.fdata.is_freq(CUR_XDIM),
+            result.fdata.is_freq(CUR_YDIM),
+            result.fdata.is_complex(CUR_XDIM),
+            result.fdata.is_complex(CUR_YDIM),
+            result.fdata.get_size(CUR_XDIM),
+            result.fdata.get_size(CUR_YDIM),
+            result.planes.len(),
+            result.planes.iter().map(|p| p.len()).sum::<usize>(),
+        );
+        log::info!(
+            "  Axes: F2 sw={:.1} obs={:.4} orig={:.1} ref_ppm={:.4} npts={}, F1 sw={:.1} obs={:.4} orig={:.1} ref_ppm={:.4} npts={}",
+            spectrum.axes[0].spectral_width_hz, spectrum.axes[0].observe_freq_mhz,
+            result.fdata.get_orig(CUR_XDIM), spectrum.axes[0].reference_ppm, spectrum.axes[0].num_points,
+            spectrum.axes[1].spectral_width_hz, spectrum.axes[1].observe_freq_mhz,
+            result.fdata.get_orig(CUR_YDIM), spectrum.axes[1].reference_ppm, spectrum.axes[1].num_points,
+        );
+    }
 
     Ok(spectrum)
 }
@@ -417,6 +503,18 @@ pub fn convert_bruker_native(dir: &Path) -> io::Result<SpectrumData> {
     let mut spectrum = fdata_planes_to_spectrum(dir, &result.fdata, &result.planes);
     spectrum.vendor_format = VendorFormat::Bruker;
     spectrum.conversion_method_used = "Built-in (native bruk2pipe)".to_string();
+
+    // Override quad_mode from Bruker FnMODE (bruk2pipe doesn't set FD2DPHASE)
+    if spectrum.is_2d() {
+        spectrum.quad_mode = match params.fnmode {
+            0 | 1 => QuadMode::Magnitude,  // QF / undefined
+            3 => QuadMode::TPPI,
+            4 => QuadMode::States,
+            5 => QuadMode::StatesTPPI,
+            6 => QuadMode::EchoAntiEcho,
+            _ => QuadMode::States,
+        };
+    }
 
     // Use experiment type from pulse program
     spectrum.experiment_type = bruker::detect_experiment_from_pulprog(&params.pulprog);

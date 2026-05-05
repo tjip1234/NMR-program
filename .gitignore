@@ -2,3 +2,5 @@
 /test-files
 /.venv
 *.log
+CLAUDE.md
+core.*

@@ -82,6 +82,41 @@ impl std::fmt::Display for ExperimentType {
     }
 }
 
+/// Quadrature detection mode for the indirect (F1) dimension of 2D experiments.
+///
+/// Controls how consecutive row pairs are combined during the F1 Fourier transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuadMode {
+    /// States (hypercomplex): even = cos, odd = sin → F1 = A + iB
+    States,
+    /// Echo-Antiecho (Rance-Kay / gradient): even = P (echo), odd = N (anti-echo) → F1 = P + N*
+    EchoAntiEcho,
+    /// States-TPPI: States with sign alternation on alternate t1 pairs (shifts axial to edge)
+    StatesTPPI,
+    /// TPPI (time-proportional phase incrementation): single real trace with phase cycling
+    TPPI,
+    /// Magnitude / QF: no quadrature detection in F1
+    Magnitude,
+}
+
+impl Default for QuadMode {
+    fn default() -> Self {
+        Self::States
+    }
+}
+
+impl std::fmt::Display for QuadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuadMode::States => write!(f, "States"),
+            QuadMode::EchoAntiEcho => write!(f, "Echo-Antiecho"),
+            QuadMode::StatesTPPI => write!(f, "States-TPPI"),
+            QuadMode::TPPI => write!(f, "TPPI"),
+            QuadMode::Magnitude => write!(f, "Magnitude"),
+        }
+    }
+}
+
 /// Axis parameters for a spectral dimension
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxisParams {
@@ -146,8 +181,29 @@ pub struct SpectrumData {
     /// 2D imaginary data (same layout as data_2d)
     #[serde(default)]
     pub data_2d_imag: Vec<Vec<f64>>,
-    /// Whether the data has been Fourier-transformed
+    /// Whether the data has been Fourier-transformed.
+    /// For 2D data, prefer checking `is_freq_f1` and `is_freq_f2`.
+    /// `is_frequency_domain` should only be true when both dimensions are in the frequency domain.
     pub is_frequency_domain: bool,
+    /// Whether F2 (direct) is already in frequency domain
+    #[serde(default)]
+    pub is_freq_f2: bool,
+    /// Whether F1 (indirect) is already in frequency domain (for mixed-domain 2D)
+    #[serde(default)]
+    pub is_freq_f1: bool,
+    /// Whether Y dimension has States/complex pairs (R/I interleaved rows)
+    #[serde(default)]
+    pub y_is_complex: bool,
+    /// Quadrature detection mode for the indirect (F1) dimension
+    #[serde(default)]
+    pub quad_mode: QuadMode,
+    /// NUS (Non-Uniform Sampling) schedule: indices of sampled F1 increments.
+    /// When present, IST reconstruction is used instead of standard F1 FFT.
+    #[serde(default)]
+    pub nus_indices: Option<Vec<usize>>,
+    /// Full F1 grid size for NUS reconstruction (number of complex F1 points)
+    #[serde(default)]
+    pub nus_full_size: Option<usize>,
     /// NMRPipe format file path after conversion
     pub nmrpipe_path: Option<PathBuf>,
     /// Which conversion method was used to load the data
@@ -169,6 +225,12 @@ impl Default for SpectrumData {
             data_2d: Vec::new(),
             data_2d_imag: Vec::new(),
             is_frequency_domain: false,
+            is_freq_f2: false,
+            is_freq_f1: false,
+            y_is_complex: false,
+            quad_mode: QuadMode::States,
+            nus_indices: None,
+            nus_full_size: None,
             nmrpipe_path: None,
             conversion_method_used: String::new(),
         }
@@ -187,6 +249,16 @@ impl SpectrumData {
     /// Check if this is a 2D experiment
     pub fn is_2d(&self) -> bool {
         self.dimensionality == Dimensionality::TwoD
+    }
+
+    /// Get the number of F2 points for 2D data (cols)
+    pub fn num_f2_points(&self) -> usize {
+        self.data_2d.first().map(|row| row.len()).unwrap_or(0)
+    }
+
+    /// Get the number of F1 points for 2D data (rows)
+    pub fn num_f1_points(&self) -> usize {
+        self.data_2d.len()
     }
 }
 

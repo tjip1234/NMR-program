@@ -32,6 +32,7 @@ mod idx {
     pub const FDF1OBS: usize = 218;     // Observe freq F1 (MHz)
     pub const FDF1ORIG: usize = 249;    // Origin F1 (Hz)
     pub const FDF1FTFLAG: usize = 222;  // 1=freq domain F1
+    pub const FDF1QUADFLAG: usize = 55;  // 0=complex, 1=real (F1)
     pub const FDF1LABEL: usize = 18;    // F1 label
     pub const FDPIPEFLAG: usize = 57;   // Pipe mode flag
     pub const FDTRANSPOSED: usize = 221; // 1=transposed
@@ -73,7 +74,9 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
         1
     };
     let is_complex = header[idx::FDQUADFLAG] as i32 == 0;
-    let is_freq_domain = header[idx::FDF2FTFLAG] as i32 == 1;
+    let is_freq_f2 = header[idx::FDF2FTFLAG] as i32 == 1;
+    let is_freq_f1 = if ndim >= 2 { header[idx::FDF1FTFLAG] as i32 == 1 } else { true };
+    let is_complex_y = if ndim >= 2 { header[idx::FDF1QUADFLAG] as i32 == 0 } else { false };
 
     let sw_x = header[idx::FDF2SW] as f64;
     let obs_x = header[idx::FDF2OBS] as f64;
@@ -110,18 +113,32 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
         imag: Vec::new(),
         data_2d: Vec::new(),
         data_2d_imag: Vec::new(),
-        is_frequency_domain: is_freq_domain,
+        is_frequency_domain: is_freq_f2 && is_freq_f1,
+        is_freq_f2,
+        is_freq_f1,
+        y_is_complex: is_complex_y,
+        quad_mode: QuadMode::States,
+        nus_indices: None,
+        nus_full_size: None,
         nmrpipe_path: Some(path.to_path_buf()),
         conversion_method_used: String::new(),
     };
 
+    // Detect F2 nucleus from label in header (works for both 1D and 2D)
+    let label_f2 = decode_label(&header, idx::FDF2LABEL, is_big_endian);
+    let nucleus_x = if !label_f2.is_empty() {
+        nucleus_from_label(&label_f2)
+    } else {
+        Nucleus::H1
+    };
+
     let axis_x = AxisParams {
-        nucleus: Nucleus::H1,
+        nucleus: nucleus_x,
         num_points: npts_x,
         spectral_width_hz: sw_x,
         observe_freq_mhz: obs_x,
         reference_ppm: ref_ppm_x,
-        label: "F2".to_string(),
+        label: if label_f2.is_empty() { "F2".to_string() } else { label_f2 },
     };
     spectrum.axes.push(axis_x);
 
@@ -132,16 +149,8 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
         let ref_ppm_y = if obs_y > 0.0 { (orig_y + sw_y) / obs_y } else { 0.0 };
 
         // Detect F1 nucleus from label in header
-        let label_f1 = decode_label(&header, idx::FDF1LABEL);
+        let label_f1 = decode_label(&header, idx::FDF1LABEL, is_big_endian);
         let nucleus_y = nucleus_from_label(&label_f1);
-        // Detect F2 nucleus from label in header
-        let label_f2 = decode_label(&header, idx::FDF2LABEL);
-        if !label_f2.is_empty() {
-            if let Some(ax) = spectrum.axes.first_mut() {
-                ax.nucleus = nucleus_from_label(&label_f2);
-                ax.label = label_f2;
-            }
-        }
 
         let axis_y = AxisParams {
             nucleus: nucleus_y,
@@ -203,9 +212,9 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
             if start < values.len() {
                 let row_data = &values[start..end];
                 if is_complex && row_data.len() >= npts_x * 2 {
-                    // Complex data: extract real and imaginary parts
-                    let real_row: Vec<f64> = row_data.iter().step_by(2).copied().collect();
-                    let imag_row: Vec<f64> = row_data.iter().skip(1).step_by(2).copied().collect();
+                    // NMRPipe file-mode layout: sequential [R(npts_x), I(npts_x)]
+                    let real_row: Vec<f64> = row_data[..npts_x].iter().copied().collect();
+                    let imag_row: Vec<f64> = row_data[npts_x..2 * npts_x].iter().copied().collect();
                     spectrum.data_2d.push(real_row);
                     spectrum.data_2d_imag.push(imag_row);
                 } else {
@@ -222,6 +231,16 @@ pub fn read_nmrpipe_file(path: &Path) -> io::Result<SpectrumData> {
             // Store first row as 1D projection for status display / fallback
             spectrum.real = first_row.clone();
         }
+        log::info!(
+            "read_nmrpipe_file 2D: {}×{} data, is_freq_f2={}, is_freq_f1={}, y_is_complex={}, \
+             has_imag={}, FDF2FTFLAG={}, FDF1FTFLAG={}, FDQUADFLAG={}, FDF1QUADFLAG={}",
+            spectrum.data_2d.len(),
+            spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0),
+            spectrum.is_freq_f2, spectrum.is_freq_f1, spectrum.y_is_complex,
+            !spectrum.data_2d_imag.is_empty(),
+            header[idx::FDF2FTFLAG], header[idx::FDF1FTFLAG],
+            header[idx::FDQUADFLAG], header[idx::FDF1QUADFLAG],
+        );
     }
 
     Ok(spectrum)
@@ -346,7 +365,9 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
 
     let npts_x = header[idx::FDSIZE] as usize;
     let is_complex_x = header[idx::FDQUADFLAG] as i32 == 0;
-    let is_freq_domain = header[idx::FDF2FTFLAG] as i32 == 1;
+    let is_freq_f2 = header[idx::FDF2FTFLAG] as i32 == 1;
+    let is_freq_f1 = header[idx::FDF1FTFLAG] as i32 == 1;
+    let is_complex_y = header[idx::FDF1QUADFLAG] as i32 == 0;
 
     let sw_x = header[idx::FDF2SW] as f64;
     let obs_x = header[idx::FDF2OBS] as f64;
@@ -359,8 +380,8 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
     let ref_ppm_y = if obs_y > 0.0 { (orig_y + sw_y) / obs_y } else { 0.0 };
 
     // Detect nucleus labels from header
-    let label_f2 = decode_label(&header, idx::FDF2LABEL);
-    let label_f1 = decode_label(&header, idx::FDF1LABEL);
+    let label_f2 = decode_label(&header, idx::FDF2LABEL, is_big_endian);
+    let label_f1 = decode_label(&header, idx::FDF1LABEL, is_big_endian);
 
     let nucleus_x = nucleus_from_label(&label_f2);
     let nucleus_y = nucleus_from_label(&label_f1);
@@ -402,7 +423,13 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
         imag: Vec::new(),
         data_2d: Vec::new(),
         data_2d_imag: Vec::new(),
-        is_frequency_domain: is_freq_domain,
+        is_frequency_domain: is_freq_f2 && is_freq_f1,
+        is_freq_f2,
+        is_freq_f1,
+        y_is_complex: is_complex_y,
+        quad_mode: QuadMode::States,
+        nus_indices: None,
+        nus_full_size: None,
         nmrpipe_path: Some(plane_files[0].to_path_buf()),
         conversion_method_used: String::new(),
     };
@@ -452,21 +479,43 @@ pub fn read_nmrpipe_2d_planes(plane_files: &[std::path::PathBuf]) -> io::Result<
     }
 
     log::info!(
-        "Read 2D NMRPipe series: {} planes × {} points",
+        "Read 2D NMRPipe series: {} planes × {} points, is_freq_f2={}, is_freq_f1={}, \
+         y_is_complex={}, is_complex_x={}, FDF2FTFLAG={}, FDF1FTFLAG={}, \
+         FDQUADFLAG={}, FDF1QUADFLAG={}",
         spectrum.data_2d.len(),
         spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0),
+        spectrum.is_freq_f2,
+        spectrum.is_freq_f1,
+        spectrum.y_is_complex,
+        is_complex_x,
+        header[idx::FDF2FTFLAG],
+        header[idx::FDF1FTFLAG],
+        header[idx::FDQUADFLAG],
+        header[idx::FDF1QUADFLAG],
     );
 
     Ok(spectrum)
 }
 
-/// Decode a 4-char label stored in two consecutive float slots
-fn decode_label(header: &[f32], start_idx: usize) -> String {
+/// Decode a 4-char label stored in two consecutive float slots.
+///
+/// NMRPipe stores label text as raw bytes at the memory address of the float
+/// slot.  When the file was written, the bytes went byte-by-byte into the
+/// float's memory representation.  To recover them we must reinterpret the
+/// float using the **file's** byte order, not a fixed order.
+fn decode_label(header: &[f32], start_idx: usize, is_big_endian: bool) -> String {
     if start_idx + 1 >= header.len() {
         return String::new();
     }
-    let bytes1 = header[start_idx].to_bits().to_be_bytes();
-    let bytes2 = header[start_idx + 1].to_bits().to_be_bytes();
+    let to_bytes = |v: f32| -> [u8; 4] {
+        if is_big_endian {
+            v.to_bits().to_be_bytes()
+        } else {
+            v.to_bits().to_le_bytes()
+        }
+    };
+    let bytes1 = to_bytes(header[start_idx]);
+    let bytes2 = to_bytes(header[start_idx + 1]);
     let combined: Vec<u8> = bytes1
         .iter()
         .chain(bytes2.iter())

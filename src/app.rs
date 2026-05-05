@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::data::spectrum::SpectrumData;
-use crate::gui::contour_view::{self, ContourViewState};
+use crate::gui::contour_view::{self, ContourAction, ContourViewState};
 use crate::gui::conversion_dialog::{
     self, ConversionAction, ConversionDialogState,
 };
@@ -20,7 +20,7 @@ use crate::gui::theme::{self, AppTheme, ThemeColors};
 use crate::gui::toolbar::{self, ToolbarAction};
 use crate::log::reproducibility::ReproLog;
 use crate::pipeline::conversion;
-use crate::pipeline::processing::{self, ProcessingOp};
+use crate::pipeline::processing::{self, Dimension, ProcessingOp};
 
 /// Which domain tab the user is viewing
 #[derive(Clone, Copy, PartialEq)]
@@ -175,14 +175,24 @@ impl NmrApp {
     /// Load a file or folder.
     /// For JDF files, opens the conversion dialog first so the user can set parameters.
     fn load_path(&mut self, path: PathBuf) {
-        // If it's a directory, find NMR files in it
+        // If it's a directory, check if it IS an NMR dataset (Bruker/Varian)
+        // before looking for NMR files inside it.
         let files_to_try = if path.is_dir() {
-            let files = conversion::list_nmr_files(&path);
-            if files.is_empty() {
-                self.status_message = format!("No NMR data files found in: {}", path.display());
-                return;
+            let dir_format = conversion::detect_format(&path);
+            if dir_format == crate::data::spectrum::VendorFormat::Bruker
+                || dir_format == crate::data::spectrum::VendorFormat::Varian
+            {
+                // The directory itself is a Bruker/Varian dataset — load it directly
+                vec![path.clone()]
+            } else {
+                // Not a recognized dataset dir — scan for NMR files inside
+                let files = conversion::list_nmr_files(&path);
+                if files.is_empty() {
+                    self.status_message = format!("No NMR data files found in: {}", path.display());
+                    return;
+                }
+                files
             }
-            files
         } else {
             vec![path.clone()]
         };
@@ -281,12 +291,82 @@ impl NmrApp {
                     .unwrap_or_default();
                 self.repro_log.set_spectrum_info(&nucleus, &spectrum.experiment_type.to_string());
                 self.spectrum = Some(spectrum);
+                self.contour_view_state.needs_reset = true;
             }
             Err(e) => {
                 self.status_message = format!("Error loading {}: {}", path.display(), e);
                 log::error!("Load error: {}", e);
             }
         }
+    }
+
+    /// Load a 1D spectrum from a saved .nmrproj project file for use as a projection overlay.
+    /// Validates nucleus match and checks ppm range overlap with the 2D axis.
+    fn load_projection_spectrum(
+        &self,
+        path: &std::path::Path,
+        expected_nucleus: Option<&crate::data::spectrum::Nucleus>,
+        axis_ppm_range: Option<(f64, f64)>,
+    ) -> std::io::Result<SpectrumData> {
+        let json = std::fs::read_to_string(path)?;
+        let save: ProjectSave = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid project file: {}", e)))?;
+
+        let spec = save.spectrum.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Project file contains no spectrum data")
+        })?;
+
+        // Reject 2D spectra
+        if spec.is_2d() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Expected a 1D spectrum for projection, but this project contains 2D data",
+            ));
+        }
+
+        // Reject if not frequency-domain
+        if !spec.is_frequency_domain {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Projection spectrum must be frequency-domain (apply FT first, then save)",
+            ));
+        }
+
+        // Validate nucleus matches the expected axis (warn only — old saves may have wrong nucleus)
+        if let Some(expected) = expected_nucleus {
+            if let Some(proj_axis) = spec.axes.first() {
+                if &proj_axis.nucleus != expected {
+                    log::warn!(
+                        "Nucleus mismatch: axis expects {} but project has {} — loading anyway \
+                         (projection may have been saved with an older version)",
+                        expected, proj_axis.nucleus
+                    );
+                }
+            }
+        }
+
+        // Warn (via log) if the projection's ppm range has no overlap with the 2D axis
+        if let (Some((axis_lo, axis_hi)), Some(proj_ax)) = (axis_ppm_range, spec.axes.first()) {
+            let proj_hi = proj_ax.index_to_ppm(0);
+            let proj_lo = proj_ax.index_to_ppm(proj_ax.num_points.saturating_sub(1));
+            let (proj_min, proj_max) = if proj_lo < proj_hi { (proj_lo, proj_hi) } else { (proj_hi, proj_lo) };
+            let (ax_min, ax_max) = if axis_lo < axis_hi { (axis_lo, axis_hi) } else { (axis_hi, axis_lo) };
+            if proj_max < ax_min || proj_min > ax_max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "No ppm overlap: projection covers {:.1}–{:.1} ppm but 2D axis covers {:.1}–{:.1} ppm",
+                        proj_min, proj_max, ax_min, ax_max
+                    ),
+                ));
+            }
+            log::info!(
+                "Projection ppm range: {:.1}–{:.1}, 2D axis: {:.1}–{:.1}",
+                proj_min, proj_max, ax_min, ax_max
+            );
+        }
+
+        Ok(spec)
     }
 
     /// Save a snapshot before an operation (for undo)
@@ -481,6 +561,56 @@ impl NmrApp {
             }
         }
 
+        // ── Integration Backgrounds (AUC shading, Draw BEFORE spectrum) ──
+        if settings.show_integrations && !self.spectrum_view_state.integrations.is_empty() {
+            let int_fill = image::Rgb([235, 245, 235]); // very light green
+            let y_base_px = margin_top as i32 + ((1.0 - (0.0 - y_min) / y_range) * plot_h as f64) as i32;
+            let y_base_px = y_base_px.clamp(margin_top as i32, (margin_top + plot_h) as i32);
+
+            for &(start_ppm, end_ppm, _) in &self.spectrum_view_state.integrations {
+                let lo = start_ppm.min(end_ppm).max(ppm_lo);
+                let hi = start_ppm.max(end_ppm).min(ppm_hi);
+                if lo >= hi { continue; }
+
+                let n = spectrum.real.len().min(ppm_scale.len());
+                for i in 0..n.saturating_sub(1) {
+                    let p1 = ppm_scale[i];
+                    let p2 = ppm_scale[i+1];
+                    // If segment is within or overlaps the integration range
+                    if (p1 >= lo && p1 <= hi) || (p2 >= lo && p2 <= hi) {
+                        let x1_frac = (ppm_hi - p1) / x_range;
+                        let x2_frac = (ppm_hi - p2) / x_range;
+                        let px1 = margin_left as i32 + (x1_frac * plot_w as f64) as i32;
+                        let px2 = margin_left as i32 + (x2_frac * plot_w as f64) as i32;
+                        
+                        let y1_val = if clip_neg { spectrum.real[i].max(0.0) } else { spectrum.real[i] };
+                        let y2_val = if clip_neg { spectrum.real[i+1].max(0.0) } else { spectrum.real[i+1] };
+                        let py1 = margin_top as i32 + ((1.0 - (y1_val - y_min) / y_range) * plot_h as f64).clamp(0.0, plot_h as f64) as i32;
+                        let py2 = margin_top as i32 + ((1.0 - (y2_val - y_min) / y_range) * plot_h as f64).clamp(0.0, plot_h as f64) as i32;
+
+                        // Fill trapezoid between (px1, py1), (px2, py2) and baseline
+                        let x_start = px1.min(px2);
+                        let x_end = px1.max(px2);
+                        for fx in x_start..=x_end {
+                            if fx < margin_left as i32 || fx > (margin_left + plot_w) as i32 { continue; }
+                            // Linear interpolation of Y
+                            let t = if x_end > x_start { (fx - x_start) as f64 / (x_end - x_start) as f64 } else { 0.5 };
+                            let fy = if px1 < px2 { py1 as f64 * (1.0 - t) + py2 as f64 * t } else { py2 as f64 * (1.0 - t) + py1 as f64 * t };
+                            let fy_px = fy as i32;
+                            
+                            let y_top = fy_px.min(y_base_px);
+                            let y_bot = fy_px.max(y_base_px);
+                            for y in y_top..=y_bot {
+                                if fx >= 0 && fx < width as i32 && y >= 0 && y < height as i32 {
+                                    imgbuf.put_pixel(fx as u32, y as u32, int_fill);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Draw spectrum — NMR convention: high ppm on left
         let spec_color = image::Rgb([26, 58, 107]); // dark navy
         let n = spectrum.real.len().min(ppm_scale.len());
@@ -503,13 +633,12 @@ impl NmrApp {
             prev_px = Some((px_x, px_y));
         }
 
-        // Draw peak markers with collision-avoidant labels
-        if settings.show_peaks {
+        // Draw peak markers with single-row labels & non-crossing kinked leaders
+        if settings.show_peaks && !self.spectrum_view_state.peaks.is_empty() {
             let peak_color = image::Rgb([224, 48, 48]);
             let leader_color = image::Rgb([200, 120, 120]);
 
-            // Phase 1: Collect all visible peak positions and label info
-            struct PeakLabel {
+            struct PLabel {
                 px_x: i32,
                 px_y: i32,
                 label: String,
@@ -518,68 +647,90 @@ impl NmrApp {
                 label_w: i32,
                 label_h: i32,
             }
-            let mut labels: Vec<PeakLabel> = Vec::new();
-            let label_pad = (char_h / 2).max(4);   // padding between labels
 
-            for peak in &self.spectrum_view_state.peaks {
-                if peak[0] < ppm_lo || peak[0] > ppm_hi { continue; }
-                let x_frac = (ppm_hi - peak[0]) / x_range;
-                let px_x = margin_left as i32 + (x_frac * plot_w as f64) as i32;
-                let y_val = if clip_neg { peak[1].max(0.0) } else { peak[1] };
-                let y_frac = 1.0 - (y_val - y_min) / y_range;
-                let px_y = margin_top as i32 + (y_frac * plot_h as f64).clamp(0.0, plot_h as f64) as i32;
+            let mut labels: Vec<PLabel> = self.spectrum_view_state.peaks.iter()
+                .filter(|p| p[0] >= ppm_lo && p[0] <= ppm_hi)
+                .map(|p| {
+                    let x_frac = (ppm_hi - p[0]) / x_range;
+                    let px_x = margin_left as i32 + (x_frac * plot_w as f64) as i32;
+                    let y_val = if clip_neg { p[1].max(0.0) } else { p[1] };
+                    let y_frac = 1.0 - (y_val - y_min) / y_range;
+                    let px_y = margin_top as i32 + (y_frac * plot_h as f64).clamp(0.0, plot_h as f64) as i32;
 
-                let label = format!("{:.2}", peak[0]);
-                let label_w = label.len() as i32 * char_w;
-                let label_h = char_h;
-                let label_x = px_x - label_w / 2;
-                // Natural position: above the marker triangle
-                let label_y = px_y - marker_gap - marker_size - label_pad - label_h;
+                    let label = format!("{:.2}", p[0]);
+                    let label_w = label.len() as i32 * char_w;
+                    let label_h = char_h;
+                    let label_y = (margin_top + 10) as i32;
 
-                labels.push(PeakLabel {
-                    px_x, px_y, label, label_x, label_y, label_w, label_h,
-                });
+                    PLabel {
+                        px_x, px_y, label,
+                        label_x: px_x - label_w / 2,
+                        label_y,
+                        label_w,
+                        label_h,
+                    }
+                })
+                .collect();
+
+            // Order-preserving horizontal sweep
+            labels.sort_by_key(|l| l.px_x);
+            let pad = (char_w / 2).max(2);
+            for _pass in 0..10 {
+                let mut moved = false;
+                for i in 1..labels.len() {
+                    let prev_right = labels[i-1].label_x + labels[i-1].label_w + pad;
+                    if labels[i].label_x < prev_right {
+                        labels[i].label_x = prev_right;
+                        moved = true;
+                    }
+                }
+                for i in (0..labels.len().saturating_sub(1)).rev() {
+                    let next_left = labels[i+1].label_x - pad;
+                    if labels[i].label_x + labels[i].label_w > next_left {
+                        labels[i].label_x = next_left - labels[i].label_w;
+                        moved = true;
+                    }
+                }
+                if !moved { break; }
+            }
+            // Keep labels within plot bounds
+            for l in &mut labels {
+                l.label_x = l.label_x.clamp(margin_left as i32, (margin_left + plot_w) as i32 - l.label_w);
             }
 
-            // Phase 2: Collision avoidance — multi-pass, check all pairs
-            labels.sort_by_key(|l| l.label_x);
-            for _pass in 0..5 {
-                let mut any_moved = false;
-                for i in 0..labels.len() {
-                    for _iter in 0..20 {
-                        let mut needs_shift = false;
-                        let mut shift_to = 0i32;
-                        for j in 0..labels.len() {
-                            if j == i { continue; }
-                            let (ax, ay, aw, ah) = (labels[i].label_x, labels[i].label_y, labels[i].label_w, labels[i].label_h);
-                            let (bx, by, bw, bh) = (labels[j].label_x, labels[j].label_y, labels[j].label_w, labels[j].label_h);
-                            // AABB overlap check with padding
-                            if ax < bx + bw + label_pad && bx < ax + aw + label_pad
-                                && ay < by + bh + label_pad && by < ay + ah + label_pad
-                            {
-                                let target = labels[j].label_y - labels[i].label_h - label_pad;
-                                if !needs_shift || target < shift_to {
-                                    shift_to = target;
-                                }
-                                needs_shift = true;
+            // Per-label knee level via iterative refinement. Knees sit BELOW the
+            // labels (in the whitespace between labels and peaks). If leader i's
+            // horizontal passes over peak[j].px_x, peak j's vertical (peak → up
+            // to knee[j]) must clear leader i's horizontal — meaning knee_y[j]
+            // sits ABOVE knee_y[i] in screen coords → level[j] > level[i].
+            let n = labels.len();
+            let mut level = vec![0_i32; n];
+            for _ in 0..n.max(1) {
+                let mut changed = false;
+                for i in 0..n {
+                    let label_cx = labels[i].label_x + labels[i].label_w / 2;
+                    let lo = labels[i].px_x.min(label_cx);
+                    let hi = labels[i].px_x.max(label_cx);
+                    for j in 0..n {
+                        if i == j { continue; }
+                        if labels[j].px_x > lo && labels[j].px_x < hi {
+                            let needed = level[i] + 1;
+                            if level[j] < needed {
+                                level[j] = needed;
+                                changed = true;
                             }
-                        }
-                        if needs_shift {
-                            // Don't shift above the title area
-                            let min_y = (15 + char_h * 2) as i32;
-                            labels[i].label_y = shift_to.max(min_y);
-                            any_moved = true;
-                        } else {
-                            break;
                         }
                     }
                 }
-                if !any_moved { break; }
+                if !changed { break; }
             }
 
-            // Phase 3: Draw markers, leader lines, and labels
-            for pl in &labels {
-                // Triangle marker (pointing down at peak)
+            let knee_step = (3.0 * settings.font_scale).round().max(2.0) as i32;
+            let knee_gap = (4.0 * settings.font_scale).round().max(2.0) as i32;
+
+            // Draw
+            for (i, pl) in labels.iter().enumerate() {
+                // 1. Triangle marker at peak tip
                 for dx in -marker_size..=marker_size {
                     for dy in 0..=marker_size {
                         if dx.abs() <= dy {
@@ -592,22 +743,19 @@ impl NmrApp {
                     }
                 }
 
-                // Leader line if label was displaced from natural position
-                let natural_y = pl.px_y - marker_gap - marker_size - label_pad - pl.label_h;
-                if pl.label_y < natural_y - label_pad {
-                    let line_x = pl.px_x;
-                    let line_top = pl.label_y + pl.label_h + 1;
-                    let line_bot = pl.px_y - marker_gap - marker_size;
-                    if line_top < line_bot {
-                        for ly in line_top..line_bot {
-                            if line_x >= 0 && line_x < width as i32 && ly >= 0 && ly < height as i32 {
-                                imgbuf.put_pixel(line_x as u32, ly as u32, leader_color);
-                            }
-                        }
-                    }
-                }
+                // 2. Kinked leader: peak → up to knee (below label) → horizontal → up to label
+                let label_center_x = pl.label_x + pl.label_w / 2;
+                let label_bottom = pl.label_y + pl.label_h;
+                let tri_top = pl.px_y - marker_gap - marker_size;
+                let knee_y = (label_bottom + knee_gap + level[i] * knee_step)
+                    .min(tri_top - 1)
+                    .max(label_bottom + 1);
 
-                // Draw label text
+                draw_line(&mut imgbuf, pl.px_x, tri_top, pl.px_x, knee_y, leader_color, width, height);
+                draw_line(&mut imgbuf, pl.px_x, knee_y, label_center_x, knee_y, leader_color, width, height);
+                draw_line(&mut imgbuf, label_center_x, knee_y, label_center_x, label_bottom, leader_color, width, height);
+
+                // 3. Label text
                 draw_simple_text(
                     &mut imgbuf,
                     &pl.label,
@@ -669,9 +817,10 @@ impl NmrApp {
                 let hi = start_ppm.max(end_ppm).min(ppm_hi);
                 if lo >= hi { continue; }
 
-                // Draw dashed boundary lines
                 let x_lo = margin_left as i32 + ((ppm_hi - hi) / x_range * plot_w as f64) as i32;
                 let x_hi = margin_left as i32 + ((ppm_hi - lo) / x_range * plot_w as f64) as i32;
+
+                // Draw dashed boundary lines
                 let dash_len = (4.0 * ms_f).round().max(2.0) as u32;
                 let gap_len = (2.0 * ms_f).round().max(1.0) as u32;
                 for y in margin_top..margin_top + plot_h {
@@ -794,6 +943,38 @@ impl NmrApp {
             }
         }
 
+        // ── Integration Backgrounds (AUC shading, Draw BEFORE spectrum) ──
+        if settings.show_integrations && !self.spectrum_view_state.integrations.is_empty() {
+            let y_base = margin_top as f64 + (1.0 - (0.0 - y_min) / y_range) * plot_h as f64;
+            let y_base = y_base.clamp(margin_top as f64, (margin_top + plot_h) as f64);
+
+            for &(start_ppm, end_ppm, _) in &self.spectrum_view_state.integrations {
+                let lo = start_ppm.min(end_ppm).max(ppm_lo);
+                let hi = start_ppm.max(end_ppm).min(ppm_hi);
+                if lo >= hi { continue; }
+
+                let mut path_data = format!("M {:.1},{:.1} ", margin_left as f64 + (ppm_hi - hi) / x_range * plot_w as f64, y_base);
+                
+                let n = spectrum.real.len().min(ppm_scale.len());
+                for i in 0..n {
+                    let ppm = ppm_scale[i];
+                    if ppm >= lo && ppm <= hi {
+                        let sx = margin_left as f64 + (ppm_hi - ppm) / x_range * plot_w as f64;
+                        let y_val = if clip_neg { spectrum.real[i].max(0.0) } else { spectrum.real[i] };
+                        let sy = margin_top as f64 + (1.0 - (y_val - y_min) / y_range) * plot_h as f64;
+                        let sy = sy.clamp(margin_top as f64, (margin_top + plot_h) as f64);
+                        path_data.push_str(&format!("L {:.1},{:.1} ", sx, sy));
+                    }
+                }
+                
+                path_data.push_str(&format!("L {:.1},{:.1} Z", margin_left as f64 + (ppm_hi - lo) / x_range * plot_w as f64, y_base));
+                svg.push_str(&format!(
+                    "<path d='{}' fill='#EBF5EB' stroke='none'/>\n",
+                    path_data
+                ));
+            }
+        }
+
         // Spectrum polyline
         let n = spectrum.real.len().min(ppm_scale.len());
         svg.push_str(&format!(
@@ -818,9 +999,9 @@ impl NmrApp {
             margin_left, margin_top, plot_w, plot_h
         ));
 
-        // Peak markers with collision-avoidant labels
+        // Peak markers with staggered top labels & kinked leaders
         if settings.show_peaks {
-            // Collect peak positions and labels
+            // Collect peak positions and labels (single row, non-crossing leaders)
             struct SvgPeakLabel {
                 sx: f64,
                 sy: f64,
@@ -831,8 +1012,7 @@ impl NmrApp {
                 label_h: f64,
             }
             let mut labels: Vec<SvgPeakLabel> = Vec::new();
-            let char_w_est = font_sm * 0.6; // approximate char width for font
-            let label_pad = font_sm * 0.4;  // padding between labels
+            let char_w_est = font_sm * 0.6;
 
             for peak in &self.spectrum_view_state.peaks {
                 if peak[0] < ppm_lo || peak[0] > ppm_hi { continue; }
@@ -845,51 +1025,73 @@ impl NmrApp {
                 let label = format!("{:.2}", peak[0]);
                 let label_w = label.len() as f64 * char_w_est;
                 let label_h = font_sm * 1.2;
-                let label_x = sx - label_w / 2.0;
-                let label_y = sy - marker_h * 2.5 - label_h - label_pad;
+                let label_y = margin_top as f64 + 10.0;
 
                 labels.push(SvgPeakLabel {
-                    sx, sy, label, label_x, label_y, label_w, label_h,
+                    sx, sy, label,
+                    label_x: sx - label_w / 2.0,
+                    label_y,
+                    label_w, label_h,
                 });
             }
 
-            // Collision avoidance — multi-pass, check all pairs
-            labels.sort_by(|a, b| a.label_x.partial_cmp(&b.label_x).unwrap_or(std::cmp::Ordering::Equal));
-            for _pass in 0..5 {
-                let mut any_moved = false;
-                for i in 0..labels.len() {
-                    for _iter in 0..20 {
-                        let mut needs_shift = false;
-                        let mut shift_to = 0.0f64;
-                        for j in 0..labels.len() {
-                            if j == i { continue; }
-                            let (ax, ay, aw, ah) = (labels[i].label_x, labels[i].label_y, labels[i].label_w, labels[i].label_h);
-                            let (bx, by, bw, bh) = (labels[j].label_x, labels[j].label_y, labels[j].label_w, labels[j].label_h);
-                            if ax < bx + bw + label_pad && bx < ax + aw + label_pad
-                                && ay < by + bh + label_pad && by < ay + ah + label_pad
-                            {
-                                let target = labels[j].label_y - labels[i].label_h - label_pad;
-                                if !needs_shift || target < shift_to {
-                                    shift_to = target;
-                                }
-                                needs_shift = true;
+            // Order-preserving horizontal sweep
+            labels.sort_by(|a, b| a.sx.partial_cmp(&b.sx).unwrap_or(std::cmp::Ordering::Equal));
+            let pad = font_sm * 0.25;
+            for _pass in 0..10 {
+                let mut moved = false;
+                for i in 1..labels.len() {
+                    let prev_right = labels[i-1].label_x + labels[i-1].label_w + pad;
+                    if labels[i].label_x < prev_right {
+                        labels[i].label_x = prev_right;
+                        moved = true;
+                    }
+                }
+                for i in (0..labels.len().saturating_sub(1)).rev() {
+                    let next_left = labels[i+1].label_x - pad;
+                    if labels[i].label_x + labels[i].label_w > next_left {
+                        labels[i].label_x = next_left - labels[i].label_w;
+                        moved = true;
+                    }
+                }
+                if !moved { break; }
+            }
+            for l in &mut labels {
+                l.label_x = l.label_x.clamp(margin_left as f64, (margin_left + plot_w) as f64 - l.label_w);
+            }
+
+            // Per-label knee level via iterative refinement. Knees sit BELOW the
+            // labels (in the whitespace between labels and peaks). If leader i's
+            // horizontal passes over peak[j].sx, peak j's vertical (peak → up
+            // to knee[j]) must clear leader i's horizontal — meaning knee_y[j]
+            // sits ABOVE knee_y[i] in screen coords → level[j] > level[i].
+            let n = labels.len();
+            let mut level = vec![0_i32; n];
+            for _ in 0..n.max(1) {
+                let mut changed = false;
+                for i in 0..n {
+                    let label_cx = labels[i].label_x + labels[i].label_w / 2.0;
+                    let lo = labels[i].sx.min(label_cx);
+                    let hi = labels[i].sx.max(label_cx);
+                    for j in 0..n {
+                        if i == j { continue; }
+                        if labels[j].sx > lo && labels[j].sx < hi {
+                            let needed = level[i] + 1;
+                            if level[j] < needed {
+                                level[j] = needed;
+                                changed = true;
                             }
-                        }
-                        if needs_shift {
-                            let min_y = 30.0 + font_lg + 4.0;
-                            labels[i].label_y = shift_to.max(min_y);
-                            any_moved = true;
-                        } else {
-                            break;
                         }
                     }
                 }
-                if !any_moved { break; }
+                if !changed { break; }
             }
 
-            // Draw markers, leader lines, labels
-            for pl in &labels {
-                // Triangle marker
+            let knee_step = (3.0 * fs).round().max(2.0);
+            let knee_gap = (4.0 * fs).round().max(2.0);
+
+            for (i, pl) in labels.iter().enumerate() {
+                // 1. Triangle marker
                 svg.push_str(&format!(
                     "<polygon points='{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}' fill='#E03030'/>\n",
                     pl.sx, pl.sy - marker_h,
@@ -897,20 +1099,26 @@ impl NmrApp {
                     pl.sx + marker_w, pl.sy - marker_h * 2.5
                 ));
 
-                // Leader line if displaced
-                let natural_y = pl.sy - marker_h * 2.5 - pl.label_h - label_pad;
-                if pl.label_y < natural_y - label_pad {
-                    svg.push_str(&format!(
-                        "<line x1='{:.1}' y1='{:.1}' x2='{:.1}' y2='{:.1}' stroke='#C87878' stroke-width='0.5'/>\n",
-                        pl.sx, pl.label_y + pl.label_h,
-                        pl.sx, pl.sy - marker_h * 2.5
-                    ));
-                }
+                // 2. Kinked leader: peak → up to knee (below label) → horizontal → up to label
+                let label_center_x = pl.label_x + pl.label_w / 2.0;
+                let label_bottom = pl.label_y + pl.label_h;
+                let tri_top = pl.sy - marker_h * 2.5;
+                let knee_y = (label_bottom + knee_gap + level[i] as f64 * knee_step)
+                    .min(tri_top - 1.0)
+                    .max(label_bottom + 1.0);
 
-                // Label
+                svg.push_str(&format!(
+                    "<polyline fill='none' stroke='#C87878' stroke-width='0.5' points='{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}'/>\n",
+                    pl.sx, tri_top,
+                    pl.sx, knee_y,
+                    label_center_x, knee_y,
+                    label_center_x, label_bottom
+                ));
+
+                // 3. Label
                 svg.push_str(&format!(
                     "<text x='{:.0}' y='{:.0}' font-family='sans-serif' font-size='{:.0}' fill='#C02020' text-anchor='middle'>{}</text>\n",
-                    pl.sx, pl.label_y + pl.label_h * 0.8, font_sm, pl.label
+                    label_center_x, pl.label_y + pl.label_h * 0.8, font_sm, pl.label
                 ));
             }
         }
@@ -950,6 +1158,7 @@ impl NmrApp {
                 if lo >= hi { continue; }
                 let x_lo = margin_left as f64 + (ppm_hi - hi) / x_range * plot_w as f64;
                 let x_hi = margin_left as f64 + (ppm_hi - lo) / x_range * plot_w as f64;
+
                 svg.push_str(&format!(
                     "<line x1='{:.1}' y1='{}' x2='{:.1}' y2='{}' stroke='#4CAF50' stroke-width='1' stroke-dasharray='4,2'/>\n",
                     x_lo, margin_top, x_lo, margin_top + plot_h
@@ -968,6 +1177,7 @@ impl NmrApp {
             }
             next_row_y += font_sm + row_gap;
         }
+
 
         // Row 3: Multiplet labels
         if settings.show_multiplets && !self.spectrum_view_state.multiplets.is_empty() {
@@ -1213,10 +1423,9 @@ impl NmrApp {
 
     /// Handle pipeline actions
     fn handle_pipeline_action(&mut self, action: PipelineAction) {
-        let spectrum = match self.spectrum.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
+        if self.spectrum.is_none() {
+            return;
+        }
 
         match action {
             PipelineAction::ApplyApodization => {
@@ -1224,19 +1433,35 @@ impl NmrApp {
                 let op = ProcessingOp::Apodization(wf.clone());
                 self.push_undo(op);
                 let spectrum = self.spectrum.as_mut().unwrap();
-                processing::apply_apodization(spectrum, &wf, &mut self.repro_log);
-                self.status_message = format!("Applied apodization: {}", wf);
+                if spectrum.is_2d() {
+                    let dim = if self.pipeline_state.selected_dimension == 0 { Dimension::F2 } else { Dimension::F1 };
+                    let _ = processing::apply_apodization_2d(spectrum, &wf, dim, &mut self.repro_log);
+                    self.status_message = format!("Applied 2D apodization ({}): {}", dim, wf);
+                } else {
+                    processing::apply_apodization(spectrum, &wf, &mut self.repro_log);
+                    self.status_message = format!("Applied apodization: {}", wf);
+                }
             }
             PipelineAction::ApplyZeroFill => {
-                let current_size = spectrum.real.len();
-                let target = current_size * (1 << self.pipeline_state.zf_factor);
-                let op = ProcessingOp::ZeroFill {
-                    target_size: target,
-                };
-                self.push_undo(op);
-                let spectrum = self.spectrum.as_mut().unwrap();
-                processing::zero_fill(spectrum, target, &mut self.repro_log);
-                self.status_message = format!("Zero-filled to {} points", target);
+                let is_2d = self.spectrum.as_ref().map(|s| s.is_2d()).unwrap_or(false);
+                if is_2d {
+                    let dim = if self.pipeline_state.selected_dimension == 0 { Dimension::F2 } else { Dimension::F1 };
+                    let op = ProcessingOp::ZeroFill { target_size: 0 }; 
+                    self.push_undo(op);
+                    let spectrum = self.spectrum.as_mut().unwrap();
+                    let _ = processing::zero_fill_2d(spectrum, dim, &mut self.repro_log);
+                    self.status_message = format!("Zero-filled 2D {} dimension to next power of two", dim);
+                } else {
+                    let current_size = self.spectrum.as_ref().map(|s| s.real.len()).unwrap_or(0);
+                    let target = current_size * (1 << self.pipeline_state.zf_factor);
+                    let op = ProcessingOp::ZeroFill {
+                        target_size: target,
+                    };
+                    self.push_undo(op);
+                    let spectrum = self.spectrum.as_mut().unwrap();
+                    processing::zero_fill(spectrum, target, &mut self.repro_log);
+                    self.status_message = format!("Zero-filled to {} points", target);
+                }
             }
             PipelineAction::ApplyFT => {
                 // Snapshot the FID before transforming so user can flip back
@@ -1264,14 +1489,36 @@ impl NmrApp {
                 let spectrum = self.spectrum.as_mut().unwrap();
                 let n_rows = spectrum.data_2d.len();
                 let n_cols = spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0);
-                processing::fourier_transform_2d(spectrum, &mut self.repro_log);
+                // Check if we need F1-only FT (F2 already frequency domain)
+                // or full 2D FT (both dimensions time domain)
+                if spectrum.is_freq_f2 && !spectrum.is_freq_f1 {
+                    // F2 is frequency domain but F1 is still time domain
+                    processing::fourier_transform_f1_only(spectrum, &mut self.repro_log);
+                } else {
+                    processing::fourier_transform_2d(spectrum, &mut self.repro_log);
+                }
                 let new_rows = spectrum.data_2d.len();
                 let new_cols = spectrum.data_2d.first().map(|r| r.len()).unwrap_or(0);
+                let nus_info = if spectrum.nus_indices.is_some() { " + IST NUS reconstruction" } else { "" };
                 self.status_message = format!(
-                    "2D Fourier Transform: {}×{} → {}×{} (magnitude mode)",
-                    n_rows, n_cols, new_rows, new_cols
+                    "2D Fourier Transform: {}×{} → {}×{} (magnitude mode{})",
+                    n_rows, n_cols, new_rows, new_cols, nus_info
                 );
                 self.domain_tab = DomainTab::FrequencyDomain;
+            }
+            PipelineAction::ReverseF2 => {
+                let op = ProcessingOp::ReverseF2;
+                self.push_undo(op);
+                let spectrum = self.spectrum.as_mut().unwrap();
+                processing::reverse_f2(spectrum, &mut self.repro_log);
+                self.status_message = "Reversed F2 (direct) axis".to_string();
+            }
+            PipelineAction::ReverseF1 => {
+                let op = ProcessingOp::ReverseF1;
+                self.push_undo(op);
+                let spectrum = self.spectrum.as_mut().unwrap();
+                processing::reverse_f1(spectrum, &mut self.repro_log);
+                self.status_message = "Reversed F1 (indirect) axis".to_string();
             }
             PipelineAction::ApplyPhaseCorrection => {
                 let ph0 = self.pipeline_state.ph0;
@@ -1279,24 +1526,34 @@ impl NmrApp {
                 let op = ProcessingOp::PhaseCorrection { ph0, ph1 };
                 self.push_undo(op);
                 let spectrum = self.spectrum.as_mut().unwrap();
-                processing::phase_correct(spectrum, ph0, ph1, &mut self.repro_log);
-                self.status_message = format!("Phase correction: PH0={:.1}°, PH1={:.1}°", ph0, ph1);
+                if spectrum.is_2d() {
+                    let dim = if self.pipeline_state.selected_dimension == 0 { Dimension::F2 } else { Dimension::F1 };
+                    let _ = processing::phase_correct_2d(spectrum, ph0, ph1, dim, &mut self.repro_log);
+                    self.status_message = format!("2D Phase correction ({}): PH0={:.1}°, PH1={:.1}°", dim, ph0, ph1);
+                } else {
+                    processing::phase_correct(spectrum, ph0, ph1, &mut self.repro_log);
+                    self.status_message = format!("Phase correction: PH0={:.1}°, PH1={:.1}°", ph0, ph1);
+                }
             }
             PipelineAction::ApplyAutoPhase => {
                 let op = ProcessingOp::AutoPhase;
                 self.push_undo(op);
                 let spectrum = self.spectrum.as_mut().unwrap();
+                let is_2d = spectrum.is_2d();
                 let (ph0, ph1) = processing::auto_phase(spectrum, &mut self.repro_log);
                 self.pipeline_state.ph0 = ph0;
                 self.pipeline_state.ph1 = ph1;
-                self.status_message = format!("Auto phase: PH0={:.1}°, PH1={:.1}°", ph0, ph1);
+                let qualifier = if is_2d { " (1D projection only)" } else { "" };
+                self.status_message = format!("Auto phase: PH0={:.1}°, PH1={:.1}°{}", ph0, ph1, qualifier);
             }
             PipelineAction::ApplyBaselineCorrection => {
                 let op = ProcessingOp::BaselineCorrection;
                 self.push_undo(op);
                 let spectrum = self.spectrum.as_mut().unwrap();
+                let is_2d = spectrum.is_2d();
                 processing::baseline_correct(spectrum, &mut self.repro_log);
-                self.status_message = "Baseline correction applied".to_string();
+                let qualifier = if is_2d { " (1D projection only)" } else { "" };
+                self.status_message = format!("Baseline correction applied{}", qualifier);
             }
             PipelineAction::ApplyManualBaseline => {
                 let points = self.spectrum_view_state.baseline_points.clone();
@@ -1310,12 +1567,15 @@ impl NmrApp {
                     };
                     self.push_undo(op);
                     let spectrum = self.spectrum.as_mut().unwrap();
+                    let is_2d = spectrum.is_2d();
                     processing::manual_baseline_correct(spectrum, &points, &mut self.repro_log);
                     self.spectrum_view_state.baseline_points.clear();
                     self.spectrum_view_state.baseline_picking = false;
+                    let qualifier = if is_2d { " (1D projection only)" } else { "" };
                     self.status_message = format!(
-                        "Manual baseline correction applied ({} anchor points)",
-                        points.len()
+                        "Manual baseline correction applied ({} anchor points){}",
+                        points.len(),
+                        qualifier
                     );
                 }
             }
@@ -1353,6 +1613,7 @@ impl NmrApp {
             PipelineAction::DetectPeaks => {
                 let threshold = self.pipeline_state.peak_threshold;
                 let min_spacing_hz = self.pipeline_state.min_peak_spacing_hz;
+                let spectrum = self.spectrum.as_ref().unwrap();
                 // Convert Hz to index distance using spectral width and data size
                 let n = spectrum.real.len();
                 let sw_hz = spectrum
@@ -1414,6 +1675,7 @@ impl NmrApp {
                 if self.spectrum_view_state.peaks.is_empty() {
                     let threshold = self.pipeline_state.peak_threshold;
                     let min_spacing_hz = self.pipeline_state.min_peak_spacing_hz;
+                    let spectrum = self.spectrum.as_ref().unwrap();
                     let n = spectrum.real.len();
                     let sw_hz = spectrum
                         .axes
@@ -1425,6 +1687,7 @@ impl NmrApp {
                     self.spectrum_view_state.peaks =
                         processing::detect_peaks(spectrum, threshold, min_dist);
                 }
+                let spectrum = self.spectrum.as_ref().unwrap();
                 let obs_mhz = spectrum
                     .axes
                     .first()
@@ -1727,12 +1990,18 @@ impl NmrApp {
                 let op = ProcessingOp::PhaseCorrection { ph0, ph1 };
                 self.push_undo(op);
                 if let Some(spectrum) = self.spectrum.as_mut() {
-                    processing::phase_correct(spectrum, ph0, ph1, &mut self.repro_log);
+                    if spectrum.is_2d() {
+                        let dim = if self.pipeline_state.selected_dimension == 0 { Dimension::F2 } else { Dimension::F1 };
+                        let _ = processing::phase_correct_2d(spectrum, ph0, ph1, dim, &mut self.repro_log);
+                        self.status_message = format!("Interactive 2D phase ({}): PH0={:.1}°, PH1={:.1}°", dim, ph0, ph1);
+                    } else {
+                        processing::phase_correct(spectrum, ph0, ph1, &mut self.repro_log);
+                        self.status_message =
+                            format!("Interactive phase applied: PH0={:.1}°, PH1={:.1}°", ph0, ph1);
+                    }
                 }
                 self.pipeline_state.ph0 = ph0;
                 self.pipeline_state.ph1 = ph1;
-                self.status_message =
-                    format!("Interactive phase applied: PH0={:.1}°, PH1={:.1}°", ph0, ph1);
             }
             PhaseAction::Cancel => {
                 self.phase_dialog_state.active = false;
@@ -2012,19 +2281,21 @@ impl eframe::App for NmrApp {
         let tab_inactive_bg = self.theme_colors.tab_inactive_bg;
         let tab_inactive_text = self.theme_colors.tab_inactive_text;
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Domain tabs: show only when we have a FID snapshot (i.e. after FT)
-            if self.fid_snapshot.is_some() && self.spectrum.is_some() {
+            // Domain tabs: show whenever we have a spectrum
+            if self.spectrum.is_some() {
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
                     // Time Domain tab
+                    let has_fid = self.fid_snapshot.is_some();
                     let td_active = self.domain_tab == DomainTab::TimeDomain;
                     let td_label = egui::RichText::new("📈 FID (Time Domain)")
                         .size(13.0)
-                        .color(if td_active { tab_active_text } else { tab_inactive_text });
+                        .color(if td_active { tab_active_text } else if !has_fid { tab_inactive_text.linear_multiply(0.5) } else { tab_inactive_text });
                     let td_btn = egui::Button::new(td_label)
                         .fill(if td_active { tab_active_bg } else { tab_inactive_bg })
                         .corner_radius(6.0);
-                    if ui.add(td_btn).clicked() {
+                    
+                    if ui.add_enabled(has_fid, td_btn).clicked() {
                         self.domain_tab = DomainTab::TimeDomain;
                         self.spectrum_view_state.auto_scale = true;
                         // Reset picking modes when switching tabs
@@ -2070,35 +2341,6 @@ impl eframe::App for NmrApp {
                         .corner_radius(6.0);
                     if ui.add(ex_btn).clicked() {
                         // Initialize PPM range on first switch
-                        if let Some(spectrum) = &self.spectrum {
-                            if spectrum.is_frequency_domain && !spectrum.axes.is_empty() {
-                                let ppm_scale = spectrum.axes[0].ppm_scale();
-                                let ppm_min = ppm_scale.iter().cloned().fold(f64::INFINITY, f64::min);
-                                let ppm_max = ppm_scale.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                                if !self.export_tab_state.image_settings.use_custom_range {
-                                    self.export_tab_state.image_settings.ppm_start = ppm_max;
-                                    self.export_tab_state.image_settings.ppm_end = ppm_min;
-                                }
-                            }
-                        }
-                        self.domain_tab = DomainTab::Export;
-                    }
-                });
-                ui.add_space(2.0);
-
-                // Also show Export tab even without FID snapshot (freq-only data)
-            } else if self.spectrum.is_some() {
-                // No FID snapshot (haven't done FT) — show just export button
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    let ex_active = self.domain_tab == DomainTab::Export;
-                    let ex_label = egui::RichText::new("📥 Export")
-                        .size(13.0)
-                        .color(if ex_active { tab_active_text } else { tab_inactive_text });
-                    let ex_btn = egui::Button::new(ex_label)
-                        .fill(if ex_active { tab_active_bg } else { tab_inactive_bg })
-                        .corner_radius(6.0);
-                    if ui.add(ex_btn).clicked() {
                         if let Some(spectrum) = &self.spectrum {
                             if spectrum.is_frequency_domain && !spectrum.axes.is_empty() {
                                 let ppm_scale = spectrum.axes[0].ppm_scale();
@@ -2226,21 +2468,103 @@ impl eframe::App for NmrApp {
                     }
                 }
             } else if let Some(spectrum) = display_spectrum {
-                // Interactive phase controls (available on any 1D data — time or freq domain)
-                if !spectrum.is_2d() {
-                    let phase_action =
-                        phase_dialog::show_phase_controls(ui, &mut self.phase_dialog_state);
-                    if phase_action != PhaseAction::None {
-                        phase_action_deferred = phase_action;
-                    }
+                // Interactive phase controls (available on any 1D projection or 2D data)
+                let phase_action =
+                    phase_dialog::show_phase_controls(ui, &mut self.phase_dialog_state);
+                if phase_action != PhaseAction::None {
+                    phase_action_deferred = phase_action;
                 }
 
                 if spectrum.is_2d() {
-                    // 2D contour display
-                    let ft_requested = contour_view::show_spectrum_2d(ui, spectrum, &mut self.contour_view_state);
-                    if ft_requested {
-                        pipeline_action_deferred = PipelineAction::ApplyFT2D;
+                    // 2D contour display — need mutable ref for quad_mode combo box
+                    let contour_action = {
+                        let spectrum_mut = if self.domain_tab == DomainTab::TimeDomain
+                            && self.fid_snapshot.is_some()
+                        {
+                            self.fid_snapshot.as_mut()
+                        } else {
+                            self.spectrum.as_mut()
+                        };
+                        if let Some(spec) = spectrum_mut {
+                            contour_view::show_spectrum_2d(ui, spec, &mut self.contour_view_state)
+                        } else {
+                            ContourAction::None
+                        }
+                    }; // mutable borrow ends here
+
+                    // Re-borrow immutably for axis info needed by action handlers
+                    let spectrum_ref = if self.domain_tab == DomainTab::TimeDomain
+                        && self.fid_snapshot.is_some()
+                    {
+                        self.fid_snapshot.as_ref()
+                    } else {
+                        self.spectrum.as_ref()
+                    };
+                    if let Some(spec) = spectrum_ref {
+                    match contour_action {
+                        ContourAction::RequestFT => {
+                            pipeline_action_deferred = PipelineAction::ApplyFT2D;
+                        }
+                        ContourAction::LoadF2Projection(path) => {
+                            let expected_nucleus = spec.axes.first().map(|a| &a.nucleus);
+                            let axis_range = spec.axes.first().map(|a| {
+                                let hi = a.index_to_ppm(0);
+                                let lo = a.index_to_ppm(a.num_points.saturating_sub(1));
+                                (lo, hi)
+                            });
+                            match self.load_projection_spectrum(&path, expected_nucleus, axis_range) {
+                                Ok(loaded) => {
+                                    let label = path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "F2 proj".to_string());
+                                    self.status_message = format!("Loaded F2 projection: {}", label);
+                                    self.contour_view_state.f2_projection_spectrum = Some(loaded);
+                                    self.contour_view_state.f2_projection_label = label;
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("Failed to load F2 projection: {}", e);
+                                }
+                            }
+                        }
+                        ContourAction::LoadF1Projection(path) => {
+                            let expected_nucleus = if spec.axes.len() >= 2 {
+                                Some(&spec.axes[1].nucleus)
+                            } else {
+                                None
+                            };
+                            let axis_range = if spec.axes.len() >= 2 {
+                                let a = &spec.axes[1];
+                                let hi = a.index_to_ppm(0);
+                                let lo = a.index_to_ppm(a.num_points.saturating_sub(1));
+                                Some((lo, hi))
+                            } else {
+                                None
+                            };
+                            match self.load_projection_spectrum(&path, expected_nucleus, axis_range) {
+                                Ok(loaded) => {
+                                    let label = path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "F1 proj".to_string());
+                                    self.status_message = format!("Loaded F1 projection: {}", label);
+                                    self.contour_view_state.f1_projection_spectrum = Some(loaded);
+                                    self.contour_view_state.f1_projection_label = label;
+                                }
+                                Err(e) => {
+                                    self.status_message = format!("Failed to load F1 projection: {}", e);
+                                }
+                            }
+                        }
+                        ContourAction::ClearF2Projection => {
+                            self.contour_view_state.f2_projection_spectrum = None;
+                            self.contour_view_state.f2_projection_label.clear();
+                        }
+                        ContourAction::ClearF1Projection => {
+                            self.contour_view_state.f1_projection_spectrum = None;
+                            self.contour_view_state.f1_projection_label.clear();
+                        }
+                        ContourAction::None => {}
                     }
+                    } // if let Some(spec) = spectrum_ref
                 } else {
                     // 1D spectrum display
                     let before = if self.pipeline_state.show_before_after {
