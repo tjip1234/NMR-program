@@ -4,3 +4,27 @@
 *.log
 CLAUDE.md
 core.*
+
+# --- added during backup cleanup 2026-07 ---
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+target/
+*.egg-info/
+node_modules/
+.pio/
+managed_components/
+output/
+outputs/
+spectra_output/
+results_output/
+*.log
+.DS_Store
+Thumbs.db
+

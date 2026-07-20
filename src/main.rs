@@ -5,6 +5,8 @@ mod data;
 mod gui;
 mod log;
 mod pipeline;
+#[cfg(test)]
+mod twod_diag;
 
 use app::NmrApp;
 

@@ -546,9 +546,13 @@ pub fn fourier_transform_2d(
                 }
             }
         } else {
-            // Real indirect dimension (no quadrature)
+            // Real indirect dimension (no quadrature): phase-modulated
+            // (P-/N-type) data. JEOL gradient-selected experiments use
+            // N-type selection, so t1 evolves as exp(-iΩt1) and a forward
+            // FFT would mirror F1 about the carrier. Conjugating the
+            // interferogram flips the frequency sign (NMRPipe `FT -neg`).
             for row_idx in 0..actual_f1_points {
-                let val = Complex::new(re_2d[row_idx][col_idx], im_2d[row_idx][col_idx]);
+                let val = Complex::new(re_2d[row_idx][col_idx], -im_2d[row_idx][col_idx]);
                 let dest = if let Some(indices) = nus_idx {
                     if row_idx < indices.len() { indices[row_idx] } else { row_idx }
                 } else {
